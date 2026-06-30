@@ -1,0 +1,13 @@
+{
+  "name": "Birthday",
+  "short": "Birthday announcements with an optional birthday role.",
+  "description": "Announce member birthdays in a configurable channel and optionally assign a birthday role for the day. Opt-in per guild, bilingual (DE/EN), with web dashboard integration.",
+  "author": ["pd-codes"],
+  "required_cogs": {},
+  "requirements": [],
+  "tags": ["birthday", "fun", "utility", "dashboard"],
+  "min_bot_version": "3.5.0",
+  "hidden": false,
+  "disabled": false,
+  "type": "COG"
+}

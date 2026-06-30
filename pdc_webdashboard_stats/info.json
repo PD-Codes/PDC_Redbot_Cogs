@@ -1,0 +1,21 @@
+{
+    "name": "PDCWebDashboardStats",
+    "short": "Server statistics for the PDC web dashboard.",
+    "description": "Collects message, voice, member, status, invite and activity statistics per server and exposes them to the PDC web dashboard (the /stats page). Stores daily time buckets with a retention period.",
+    "tags": [
+        "stats",
+        "analytics",
+        "dashboard",
+        "web"
+    ],
+    "author": [
+        "pd-codes"
+    ],
+    "requirements": [],
+    "hidden": false,
+    "disabled": false,
+    "min_bot_version": "3.5.0",
+    "install_msg": "WebDashboardStats installed. Enable the presence/member intents for full status/activity data. The 'Statistics' page appears in the web dashboard.",
+    "end_user_data_statement": "This cog stores aggregated per-guild statistics in daily buckets (message/voice/activity counts, member and channel IDs with counts). Old data is pruned after the retention period. It does not store message content.",
+    "type": "COG"
+}

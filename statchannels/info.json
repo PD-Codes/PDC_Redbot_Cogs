@@ -1,0 +1,13 @@
+{
+  "name": "StatChannels",
+  "short": "Live counter / stat voice channels (members, online, boosts …).",
+  "description": "Keep voice (or any) channel names updated with live server stats like member count, humans, bots, boosts. Opt-in per guild, bilingual (DE/EN), with web dashboard integration. Channel renames are rate-limit friendly (updated every ~10 minutes).",
+  "author": ["pd-codes"],
+  "required_cogs": {},
+  "requirements": [],
+  "tags": ["stats", "counter", "voice", "utility", "dashboard"],
+  "min_bot_version": "3.5.0",
+  "hidden": false,
+  "disabled": false,
+  "type": "COG"
+}

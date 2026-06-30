@@ -1,0 +1,59 @@
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: web-dashboard\n"
+"POT-Creation-Date: 2026-06-21 00:00+0000\n"
+"Last-Translator: \n"
+"Language-Team: English\n"
+"Language: en_US\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+#: pdc_webdashboard.py
+msgid "Status: {state}"
+msgstr "Status: {state}"
+
+#: pdc_webdashboard.py
+msgid "läuft"
+msgstr "running"
+
+#: pdc_webdashboard.py
+msgid "gestoppt"
+msgstr "stopped"
+
+#: pdc_webdashboard.py
+msgid "Adresse: http://{host}:{port}"
+msgstr "Address: http://{host}:{port}"
+
+#: pdc_webdashboard.py
+msgid "Registrierte Beiträge: {n} (aus {c} Cogs)"
+msgstr "Registered contributions: {n} (from {c} cogs)"
+
+#: pdc_webdashboard.py
+msgid "Start fehlgeschlagen: {error}"
+msgstr "Start failed: {error}"
+
+#: pdc_webdashboard.py
+msgid "Gateway gestartet."
+msgstr "Gateway started."
+
+#: pdc_webdashboard.py
+msgid "Gateway gestoppt."
+msgstr "Gateway stopped."
+
+#: pdc_webdashboard.py
+msgid "Gespeichert: {host}:{port}. Bitte neu starten."
+msgstr "Saved: {host}:{port}. Please restart."
+
+#: pdc_webdashboard.py
+msgid "Token per DM gesendet."
+msgstr "Token sent via DM."
+
+#: pdc_webdashboard.py
+msgid "Ich konnte dir keine DM senden. Bitte DMs aktivieren."
+msgstr "I couldn't send you a DM. Please enable DMs."
+
+#: pdc_webdashboard.py
+msgid "Neues Token erzeugt und Gateway neu gestartet. Hole es mit `[p]pdcdashboard token`."
+msgstr "New token generated and gateway restarted. Retrieve it with `[p]pdcdashboard token`."

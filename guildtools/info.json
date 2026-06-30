@@ -1,0 +1,11 @@
+{
+  "author": ["pd-codes"],
+  "install_msg": "GuildTools Installed.",
+  "name": "GuildTools",
+  "short": "Slash/Hybrid Tools for Guilds",
+  "description": "Assorted tools for our guilds (whois, absences, ready-times, exports).",
+  "end_user_data_statement": "This cog does not store any personal user data.",
+  "tags": ["guild","tools"],
+  "min_bot_version": "3.5.0",
+  "type": "COG"
+}

@@ -1,0 +1,13 @@
+{
+  "name": "MemeGen",
+  "short": "Post memes on command or on a timer.",
+  "description": "Fetch memes from meme-api.com (Reddit) on command, or auto-post into a channel on an interval. Configurable subreddit sources. Opt-in per guild, bilingual (DE/EN), with web dashboard integration.",
+  "author": ["pd-codes"],
+  "required_cogs": {},
+  "requirements": [],
+  "tags": ["fun", "meme", "dashboard"],
+  "min_bot_version": "3.5.0",
+  "hidden": false,
+  "disabled": false,
+  "type": "COG"
+}

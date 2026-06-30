@@ -1,0 +1,18 @@
+{
+    "author": ["pd-codes"],
+    "name": "ReactionRole",
+    "short": "Simple ReactionRole system with IDs and manual sync",
+    "description": "Adds reaction roles with generated IDs, supports manual syncing and slash commands.",
+    "version": "1.0.0",
+    "requirements": [],
+    "permissions": [
+        "manage_roles",
+        "add_reactions",
+        "read_message_history"
+    ],
+    "min_bot_version": "3.5.0",
+    "install_msg": "ReactionRole loaded. See [p]help ReactionRole to set up reaction roles.",
+    "end_user_data_statement": "This cog stores per-guild reaction-role mappings (message, emoji and role IDs). It does not store personal user data.",
+    "tags": ["roles", "reactionrole", "dashboard"],
+    "type": "COG"
+}

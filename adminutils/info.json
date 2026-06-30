@@ -1,0 +1,11 @@
+{
+  "author": ["pd-codes"],
+  "install_msg": "AdminUtils loaded. Use /kick, /ban, /timeout, /purge, /messagemove.",
+  "name": "AdminUtils",
+  "short": "Slash/hybrid admin tools",
+  "description": "Kick, ban, timeout, purge (with exceptions), MessageMove (copy + delete).",
+  "end_user_data_statement": "This cog does not store any personal user data.",
+  "tags": ["moderation", "admin", "slash"],
+  "min_bot_version": "3.5.0",
+  "type": "COG"
+}

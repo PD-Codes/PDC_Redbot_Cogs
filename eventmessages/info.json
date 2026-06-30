@@ -1,0 +1,26 @@
+{
+    "name": "EventMessages",
+    "short": "Automatic join/leave/ban/timeout messages",
+    "description": "Automatically sends public messages on server events like join, leave, ban, unban and timeouts. Configured via slash commands (em-).",
+    "end_user_data_statement": "This cog only stores guild-specific settings (enabled state and channel IDs). No personal data is stored permanently.",
+    "install_msg": "EventMessages loaded. Configure it with the em- slash commands or via the web dashboard.",
+    "type": "COG",
+    "author": [
+        "pd-codes"
+    ],
+    "min_bot_version": "3.5.0",
+    "min_python_version": [
+        3,
+        10,
+        0
+    ],
+    "hidden": false,
+    "disabled": false,
+    "requirements": [],
+    "tags": [
+        "utility",
+        "events",
+        "moderation",
+        "messages"
+    ]
+}

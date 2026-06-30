@@ -1,0 +1,22 @@
+{
+    "author": [
+        "pd-codes"
+    ],
+    "name": "PDCWebDashboard",
+    "short": "Custom, modular and secure web dashboard system for Red.",
+    "description": "Provides an RPC gateway and an integration registry. Other cogs embed themselves (widgets + contextual panels) instead of having their own separate page. Frontend: a separate SvelteKit web app with Discord OAuth2.",
+    "install_msg": "Thanks for installing WebDashboard!\n\nNext steps:\n1. `[p]load pdc_webdashboard`\n2. `[p]pdcdashboard token` (token via DM for the web app)\n3. Check `[p]pdcdashboard status`\n\nThe separate web app lives in PDC_Redbot_Webapp. Details: see ARCHITECTURE.md.",
+    "tags": [
+        "dashboard",
+        "web",
+        "rpc",
+        "admin",
+        "ui"
+    ],
+    "requirements": [],
+    "min_bot_version": "3.5.0",
+    "type": "COG",
+    "hidden": false,
+    "disabled": false,
+    "end_user_data_statement": "This cog stores a randomly generated gateway token plus host/port settings. When the web app is active it processes Discord user IDs for permission checks but does not store them permanently."
+}

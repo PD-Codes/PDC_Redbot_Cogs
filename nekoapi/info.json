@@ -1,0 +1,23 @@
+{
+    "author": [
+        "pd-codes"
+    ],
+    "name": "NekoAPI",
+    "short": "Shows anime images from NekosAPI with a rating filter.",
+    "description": "Fetches images and GIFs from https://nekosapi.com with rating support (safe, suggestive, borderline, explicit). Explicit is only allowed in NSFW channels.",
+    "install_msg": "Thanks for installing NekoAPI! Use !nekoapi or /nekoapi.",
+    "required_cogs": {},
+    "requirements": [],
+    "tags": [
+        "fun",
+        "anime",
+        "nekos",
+        "images",
+        "api"
+    ],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG",
+    "end_user_data_statement": "This cog stores per-guild rating settings only. It does not store any personal user data."
+}

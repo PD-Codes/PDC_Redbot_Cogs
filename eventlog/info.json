@@ -1,0 +1,13 @@
+{
+  "name": "EventLog",
+  "short": "Server event logging (joins/leaves, edits/deletes, roles, voice).",
+  "description": "Log server events to a channel: member joins/leaves, message edits/deletes, role and nickname changes, voice activity. Each event type can be toggled. Opt-in per guild, bilingual (DE/EN), with web dashboard integration.",
+  "author": ["pd-codes"],
+  "required_cogs": {},
+  "requirements": [],
+  "tags": ["logging", "moderation", "events", "utility", "dashboard"],
+  "min_bot_version": "3.5.0",
+  "hidden": false,
+  "disabled": false,
+  "type": "COG"
+}

@@ -1,0 +1,13 @@
+{
+  "name": "SocialFeed",
+  "short": "Watch RSS/Atom feeds (YouTube, blogs, Reddit …) and post new items.",
+  "description": "Add feed URLs (e.g. a YouTube channel feed, a blog, a subreddit RSS) and the bot posts new entries to a channel. Manage feeds from the web dashboard or commands. Opt-in per guild, bilingual (DE/EN).",
+  "author": ["pd-codes"],
+  "required_cogs": {},
+  "requirements": ["feedparser"],
+  "tags": ["rss", "feed", "social", "youtube", "dashboard"],
+  "min_bot_version": "3.5.0",
+  "hidden": false,
+  "disabled": false,
+  "type": "COG"
+}

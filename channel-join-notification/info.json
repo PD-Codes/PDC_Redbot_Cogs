@@ -1,0 +1,16 @@
+{
+  "author": ["pd-codes"],
+  "name": "channeljoinnotification",
+  "short": "DM notification when joining configured channels",
+  "description": "Sends a DM with a customizable text when users join specific voice/stage channels. Includes an ephemeral setup UI and a guild dashboard page.",
+  "version": "1.0.0",
+  "requirements": [],
+  "permissions": [],
+  "tags": ["notification", "dm", "voice", "dashboard"],
+  "type": "COG",
+  "hidden": false,
+  "min_bot_version": "3.5.0",
+  "end_user_data_statement": "Stores per-guild channel notification settings (channel id, enabled flag, message template). No user data is stored.",
+  "install_msg": "ChannelJoinNotification loaded. Set it up with /join-notification or via the web dashboard."
+}
+

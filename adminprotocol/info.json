@@ -1,0 +1,26 @@
+{
+    "name": "AdminProtocol",
+    "short": "Detailed administration & activity log",
+    "description": "Logs administrative actions and user activity on the server to channels of your choice. Fully configurable via the web UI.",
+    "end_user_data_statement": "This cog only stores guild-specific settings (channel selections, ignore lists and enabled state). No personal data is stored permanently.",
+    "install_msg": "AdminProtocol loaded. Configure the logging channels via the web dashboard.",
+    "type": "COG",
+    "author": [
+        "pd-codes"
+    ],
+    "min_bot_version": "3.5.0",
+    "min_python_version": [
+        3,
+        10,
+        0
+    ],
+    "hidden": false,
+    "disabled": false,
+    "requirements": [],
+    "tags": [
+        "utility",
+        "events",
+        "moderation",
+        "logging"
+    ]
+}

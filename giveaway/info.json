@@ -1,0 +1,13 @@
+{
+  "name": "Giveaway",
+  "short": "Button-based giveaways with embed cards, auto draw and reroll.",
+  "description": "Run giveaways with a one-click entry button (persistent across restarts), an embed card, configurable duration and winner count, automatic drawing and reroll. Bilingual (DE/EN), with web dashboard integration.",
+  "author": ["pd-codes"],
+  "required_cogs": {},
+  "requirements": [],
+  "tags": ["giveaway", "fun", "engagement", "dashboard"],
+  "min_bot_version": "3.5.0",
+  "hidden": false,
+  "disabled": false,
+  "type": "COG"
+}
