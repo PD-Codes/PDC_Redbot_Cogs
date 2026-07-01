@@ -39,9 +39,9 @@ DAY_KEY_TO_EN = {
 
 
 def day_label(key: str, lang: str = "en-US") -> str:
-    if lang.startswith("en"):
-        return DAY_KEY_TO_EN.get(key, key)
-    return DAY_KEY_TO_DE.get(key, key)
+    if lang.startswith("de"):
+        return DAY_KEY_TO_DE.get(key, key)
+    return DAY_KEY_TO_EN.get(key, key)
 
 TIME_RE = re.compile(r"^(?:[01]?\d|2[0-3]):[0-5]\d$")  # 24h HH:MM
 

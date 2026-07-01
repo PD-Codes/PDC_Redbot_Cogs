@@ -45,7 +45,7 @@ def L(de: str, en: Optional[str] = None) -> "LocalizedStr":
 def tr(ctx: Any, de: str, en: str) -> str:
     """Inside a handler: pick text by the web UI language (``ctx.locale``)."""
     loc = str(getattr(ctx, "locale", "") or "")
-    return en if loc.lower().startswith("en") else de
+    return de if loc.lower().startswith("de") else en
 
 
 def tr_lang(lang: Optional[str], de: str, en: str) -> str:
@@ -53,7 +53,7 @@ def tr_lang(lang: Optional[str], de: str, en: str) -> str:
 
     For a cog's Discord output (responses, embeds, DMs). The cog stores a per-guild
     ``language`` and passes it here: ``tr_lang(lang, "Deutsch", "English")``."""
-    return en if str(lang or "").lower().startswith("en") else de
+    return de if str(lang or "").lower().startswith("de") else en
 
 
 # --------------------------------------------------------------------------- #

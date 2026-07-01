@@ -433,7 +433,7 @@ class GuildTools(commands.Cog):
         if not realm_use:
             return await interaction.followup.send(tr_lang(lang, "Bitte Realm angeben oder `/set-wow-defaults` setzen.", "Please provide a realm or set `/set-wow-defaults`."), ephemeral=True)
 
-        locale = "en_US" if lang.startswith("en") else "de_DE"
+        locale = "de_DE" if lang.startswith("de") else "en_US"
         try:
             prof = await self._get_profile(region, realm_use, charname, locale=locale)
         except Exception as e:
