@@ -116,7 +116,81 @@ from pdc_webdashboard.integration import dashboard_widget, dashboard_panel
   unabhängig von AAA3As Mixin-Vererbung. Du kannst AAA3As Mixin also normal weiter erben.
 - Keines der beiden Systeme schaltet das andere ab.
 
-## Optional: Vollständige eigene Seite
+## Eigene Seiten (`@dashboard_page`)
 
-Wenn ein Cog doch eine eigene Ansicht braucht, nutze `@dashboard_page` mit einem
-Komponentenbaum (`Component`) – ebenfalls ohne rohes HTML. Siehe `ARCHITECTURE.md §3.3`.
+Ein Cog kann **vollständige Unterseiten** im Dashboard registrieren – als
+Komponentenbaum (`Component`), ohne rohes HTML. Wo die Seite erscheint, steuert
+`scope`:
+
+- `scope="global"` → eigener Menüpunkt unter **„Module (Cog) Seiten"** (Hauptmenü,
+  server-unabhängig, z. B. WoW-Token).
+- `scope="guild"`  → als Button auf der **Server-Detailseite** (neben
+  „Bot-Einstellungen"); der Handler bekommt dann `ctx.guild`.
+
+```python
+from .pdc_dashboard import (
+    dashboard_page, PageSchema, Component, Control, L, tr,
+)
+
+class MyCog(commands.Cog):
+
+    @dashboard_page(
+        "overview",                     # identifier (Key = "<CogName>:overview")
+        L("Übersicht", "Overview"),     # Menü-/Seitentitel (folgt der UI-Sprache)
+        scope="global",                 # global | guild
+        permission="authenticated",     # authenticated | guild_member | guild_admin | bot_owner
+        icon="chart",                   # optional
+        nav=True,                       # im Menü anzeigen?
+    )
+    async def my_page(self, ctx):
+        # Aktuelle Auswahl der Controls kommt in ctx.params an (server-driven).
+        region = (ctx.params or {}).get("region") or "eu"
+
+        controls = [
+            Control.select(
+                "region", L("Region", "Region"),
+                [{"value": "eu", "label": "EU"}, {"value": "us", "label": "US"}],
+                value=region,
+            )
+        ]
+        comps = [
+            Component.heading(L(f"Region {region.upper()}", f"Region {region.upper()}")),
+            Component.text(tr(ctx, "Beschreibung …", "Description …")),
+            Component.chart(
+                labels=["Mo", "Di", "Mi"],
+                series=[{"label": "Wert", "data": [1, 3, 2]}],
+                title="Trend", height=280,
+            ),
+        ]
+        return PageSchema(components=comps, controls=controls)
+```
+
+### Server-driven Controls (Dropdowns)
+
+`PageSchema(controls=[...])` deklariert Steuerelemente. Ändert der Nutzer eine
+Auswahl, ruft die Web-App **denselben Handler erneut** auf – die gewählten Werte
+stehen in `ctx.params` (z. B. `ctx.params["region"]`). Der Handler gibt einfach ein
+neues `PageSchema` für die Auswahl zurück. Rein deklarativ, kein Client-JS, keine
+XSS-Fläche.
+
+`Control.select(id, label, options, *, value=None)` – `options` ist eine Liste aus
+`{"value": ..., "label": ...}`; Labels dürfen `L("de", "en")` sein.
+
+### Komponenten (`Component`)
+
+Bequeme Konstruktoren: `Component.heading(text, level=2)`, `Component.text(text)`,
+`Component.divider()`, `Component.chart(labels=, series=, chart_type=..., title=, height=)`,
+`Component.table(columns=, rows=, title=)`, `Component.grid(children, cols=2)`.
+
+`chart_type` unterstützt `"line"`, `"area"`, `"bar"` und `"doughnut"` (bzw. `"donut"`).
+Beim Donut wird die **erste** Serie (`series[0].data`) mit `labels` als Segmente gezeichnet.
+
+`series` = `[{"label": str, "data": [zahl|None]}]`. Texte (`title`/`text`/`label`/
+`heading`) dürfen `L("de", "en")` sein und folgen der UI-Sprache.
+
+**Panel einbetten:** `Component("panel_ref", {"key": "<CogName>:<panel_id>", "title": ...})`
+rendert ein bestehendes Panel (Formular) direkt in der Seite. Auf guild-scoped Seiten
+speichert es in den Kontext-Server.
+
+Siehe `ARCHITECTURE.md §3.3` und das Beispiel im Cog `dashboardtemplate`
+(`example_page`).

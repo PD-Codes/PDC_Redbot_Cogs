@@ -16,6 +16,7 @@ try:
     )
     from pdc_webdashboard.integration.models import (  # noqa: F401
         Component,
+        Control,
         Field,
         L,
         PageSchema,
@@ -103,7 +104,7 @@ except Exception:  # pdc_webdashboard not installed
         kpi = list = chart = status = markdown = ok = fail = _factory  # type: ignore
         text = textarea = number = switch = select = multiselect = channel = role = _factory  # type: ignore
 
-    WidgetData = PanelSchema = PageSchema = Field = Component = SubmitResult = _Stub  # type: ignore
+    WidgetData = PanelSchema = PageSchema = Field = Component = Control = SubmitResult = _Stub  # type: ignore
     DashboardContext = object  # type: ignore
 
 

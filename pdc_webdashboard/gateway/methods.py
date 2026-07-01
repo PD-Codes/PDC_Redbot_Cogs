@@ -2110,3 +2110,50 @@ def _maybe_integration_base():
 def setup_core_methods(gateway: Any) -> Dispatcher:
     """Returns the prepared dispatcher (core methods already registered)."""
     return dispatcher
+
+
+# --------------------------------------------------------------------------- #
+# Background monitor (cog-update check + alerts) – config for the web UI
+# --------------------------------------------------------------------------- #
+def _dashboard_cog(gateway: Any):
+    return gateway.bot.get_cog("pdc_webdashboard") or gateway.bot.get_cog("WebDashboard")
+
+
+@dispatcher.method("monitor.get")
+async def monitor_get(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Monitor config + last cog-update result (bot owner only)."""
+    ctx = await _build_context(gateway, params)
+    await _require(gateway, ctx, "bot_owner")
+    cog = _dashboard_cog(gateway)
+    if cog is None:
+        raise RpcError(INVALID_PARAMS, "Dashboard-Cog nicht geladen")
+    return {"config": await cog.config.monitor(), "last": await cog.config.monitor_last()}
+
+
+@dispatcher.method("monitor.set")
+async def monitor_set(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Update monitor config (bot owner only)."""
+    ctx = await _build_context(gateway, params)
+    await _require(gateway, ctx, "bot_owner")
+    cog = _dashboard_cog(gateway)
+    if cog is None:
+        raise RpcError(INVALID_PARAMS, "Dashboard-Cog nicht geladen")
+    args = params.get("args") or {}
+    cur = await cog.config.monitor()
+    allowed_h = {0, 1, 2, 4, 8, 16, 24}
+    if "cog_update_interval_h" in args:
+        try:
+            h = int(args["cog_update_interval_h"])
+        except (TypeError, ValueError):
+            h = 0
+        cur["cog_update_interval_h"] = h if h in allowed_h else 0
+    if "alerts_dm" in args:
+        cur["alerts_dm"] = bool(args["alerts_dm"])
+    if "mem_threshold_mb" in args:
+        try:
+            cur["mem_threshold_mb"] = max(0, int(args["mem_threshold_mb"]))
+        except (TypeError, ValueError):
+            cur["mem_threshold_mb"] = 0
+    await cog.config.monitor.set(cur)
+    gateway.audit("monitor.set", ctx, cur)
+    return {"ok": True, "config": cur}

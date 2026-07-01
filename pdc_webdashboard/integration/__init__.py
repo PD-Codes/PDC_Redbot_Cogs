@@ -20,6 +20,7 @@ from .decorators import (
 )
 from .models import (
     Component,
+    Control,
     Field,
     FieldType,
     L,
@@ -55,6 +56,7 @@ __all__ = [
     "Field",
     "FieldType",
     "Component",
+    "Control",
     "SubmitResult",
     "L",
     "LocalizedStr",

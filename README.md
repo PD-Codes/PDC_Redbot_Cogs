@@ -35,6 +35,11 @@ besteht aus diesen Cogs hier:
 | `dashboardtemplate` | **Kopier-Vorlage** mit allen Feature-Beispielen (Widget, Panels, Liste mit Anlegen/Bearbeiten/Löschen, globales Panel). |
 | `dashboardexample` | Minimal-Beispiel der Integration. |
 
+> 🆕 **Eigene Seiten:** Cogs können via `@dashboard_page` ganze Unterseiten registrieren
+> (Komponentenbaum + server-driven Dropdowns). Globale Seiten erscheinen im Menü
+> **„Module (Cog) Seiten"**, guild-spezifische als Button auf der Server-Detailseite.
+> Beispiel: `wowtokentracker` (Retail/Classic + Region-Auswahl). Siehe `pdc_webdashboard/INTEGRATION.md`.
+
 Eigenen Cog anbinden: siehe `pdc_webdashboard/INTEGRATION.md` + den Drop-in `pdc_dashboard.py`
 (1:1 kopierbar, funktioniert auch ohne installiertes Dashboard und parallel zu AAA3A).
 Jeder Cog erscheint als **ein Modul mit Tabs** auf der Server-Detailseite.

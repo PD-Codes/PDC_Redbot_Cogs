@@ -33,8 +33,12 @@ from .pdc_dashboard import (
     dashboard_widget,
     dashboard_panel,
     dashboard_list,
+    dashboard_page,
     WidgetData,
     PanelSchema,
+    PageSchema,
+    Component,
+    Control,
     Field,
     SubmitResult,
     L,
@@ -296,6 +300,42 @@ class DashboardTemplate(commands.Cog):
         async with self.config.guild(ctx.guild).items() as items:
             items[uuid.uuid4().hex[:8]] = {"name": name, "note": str(data.get("note", ""))}
         return SubmitResult.ok(tr(ctx, "Eintrag angelegt.", "Entry created."))
+
+    # ---- 5) Full page (@dashboard_page) -------------------------------------
+    # A standalone page (component tree, no raw HTML). scope="global" -> shows up
+    # in the "Module (Cog) Sites" menu; scope="guild" -> button on the server page.
+    # Server-driven controls: the chosen values arrive in ctx.params, and the
+    # handler just returns a fresh PageSchema for that selection.
+    @dashboard_page(
+        "example",
+        L("Vorlage-Seite", "Template page"),
+        scope="global",
+        permission="authenticated",
+        icon="chart",
+    )
+    async def example_page(self, ctx):
+        mode = (ctx.params or {}).get("mode") or "a"
+        controls = [
+            Control.select(
+                "mode",
+                L("Ansicht", "View"),
+                [{"value": "a", "label": L("Reihe A", "Series A")},
+                 {"value": "b", "label": L("Reihe B", "Series B")}],
+                value=mode,
+            )
+        ]
+        data = [3, 5, 4, 6] if mode == "a" else [6, 4, 5, 3]
+        comps = [
+            Component.heading(L("Beispiel-Seite", "Example page")),
+            Component.text(tr(ctx, "Wähle oben eine Ansicht.", "Pick a view above.")),
+            Component.chart(
+                labels=["Mo", "Di", "Mi", "Do"],
+                series=[{"label": mode.upper(), "data": data}],
+                title=L("Trend", "Trend"),
+                height=280,
+            ),
+        ]
+        return PageSchema(components=comps, controls=controls)
 
     # ---- Owner command for a quick check ------------------------------------
     # Demonstrates tr_lang: this is DISCORD output, so it follows the cog's

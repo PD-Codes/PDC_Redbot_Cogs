@@ -283,10 +283,88 @@ class Component:
             "children": [c.to_dict(locale) for c in self.children],
         }
 
+    # --- convenience constructors (ergonomic page building) --------------- #
+    @classmethod
+    def heading(cls, text: "LocalizedStr", *, level: int = 2) -> "Component":
+        return cls("heading", {"text": text, "level": level})
+
+    @classmethod
+    def text(cls, text: "LocalizedStr") -> "Component":
+        return cls("text", {"text": text})
+
+    @classmethod
+    def divider(cls) -> "Component":
+        return cls("divider", {})
+
+    @classmethod
+    def chart(
+        cls,
+        *,
+        labels: List[str],
+        series: List[Dict[str, Any]],
+        chart_type: str = "line",
+        title: Optional["LocalizedStr"] = None,
+        height: Optional[int] = None,
+    ) -> "Component":
+        """A chart block. ``series`` = ``[{"label": str, "data": [num|None]}]``."""
+        return cls("chart", {"title": title, "type": chart_type,
+                             "labels": labels, "series": series, "height": height})
+
+    @classmethod
+    def table(cls, *, columns: List[Dict[str, Any]], rows: List[Dict[str, Any]],
+              title: Optional["LocalizedStr"] = None) -> "Component":
+        return cls("table", {"title": title, "columns": columns, "rows": rows})
+
+    @classmethod
+    def grid(cls, children: List["Component"], *, cols: int = 2) -> "Component":
+        return cls("grid", {"cols": cols}, list(children))
+
+
+@dataclass
+class Control:
+    """A server-driven page control. Its current value is sent back to the page
+    handler as ``ctx.params[<id>]`` so the handler can return matching data
+    (e.g. a region/type dropdown). Purely declarative - no client-side logic."""
+
+    id: str
+    label: "LocalizedStr"
+    type: str = "select"  # select (extensible)
+    options: List[Dict[str, Any]] = field(default_factory=list)  # [{value,label}]
+    value: Optional[str] = None  # current / default value
+
+    def to_dict(self, locale=None) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "label": resolve_locale(self.label, locale),
+            "type": self.type,
+            "value": self.value,
+            "options": [
+                {
+                    "value": o.get("value"),
+                    "label": resolve_locale(o.get("label", o.get("value")), locale),
+                }
+                for o in self.options
+            ],
+        }
+
+    @classmethod
+    def select(cls, id: str, label: "LocalizedStr", options: List[Dict[str, Any]],
+               *, value: Optional[str] = None) -> "Control":
+        return cls(id=id, label=label, type="select", options=options, value=value)
+
 
 @dataclass
 class PageSchema:
     components: List[Component] = field(default_factory=list)
+    # Optional server-driven controls (e.g. dropdowns). Their values are posted
+    # back and arrive in the handler as ``ctx.params``; the handler returns a new
+    # PageSchema for the selection.
+    controls: List["Control"] = field(default_factory=list)
 
     def to_dict(self, locale=None) -> Dict[str, Any]:
-        return {"components": [c.to_dict(locale) for c in self.components]}
+        return {
+            "components": [c.to_dict(locale) for c in self.components],
+            "controls": [
+                (c.to_dict(locale) if hasattr(c, "to_dict") else c) for c in self.controls
+            ],
+        }

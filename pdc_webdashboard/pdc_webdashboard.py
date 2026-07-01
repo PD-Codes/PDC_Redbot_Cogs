@@ -5,8 +5,10 @@ other cogs register their widgets, panels and pages.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
+import time
 from typing import Any, Optional
 
 import discord
@@ -57,9 +59,14 @@ class WebDashboard(commands.Cog, name="pdc_webdashboard"):
             session_epoch=0,
             custom_pages=[],  # [{slug, title, html, nav}]
             audit_log=[],     # [{action, user, guild, detail, time}] – last 1000
+            # Background monitor: automatic cog-update check + owner-DM alerts.
+            monitor={"cog_update_interval_h": 0, "alerts_dm": False, "mem_threshold_mb": 0},
+            monitor_last={"cogs": [], "checked_at": 0},
+            monitor_alerted={"cogs": [], "mem": False},
         )
         self.registry = Registry()
         self.gateway: Optional[Gateway] = None
+        self._monitor_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -77,10 +84,15 @@ class WebDashboard(commands.Cog, name="pdc_webdashboard"):
                 self.registry.register_cog(cog)
         if await self.config.autostart():
             await self._start_gateway()
+        # Background monitor (cog-update check + alerts).
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
 
     async def cog_unload(self) -> None:
         from .gateway.logbuffer import uninstall as _uninstall_logbuffer
         _uninstall_logbuffer()
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            self._monitor_task = None
         await self._stop_gateway()
 
     async def _start_gateway(self) -> None:
@@ -107,6 +119,93 @@ class WebDashboard(commands.Cog, name="pdc_webdashboard"):
         if self.gateway is not None:
             await self.gateway.stop()
             self.gateway = None
+
+    # ------------------------------------------------------------------ #
+    # Background monitor: cog-update check + owner-DM alerts
+    # ------------------------------------------------------------------ #
+    async def _monitor_loop(self) -> None:
+        """Periodically check for cog updates (interval from config) and alert."""
+        try:
+            await self.bot.wait_until_red_ready()
+        except Exception:
+            pass
+        while True:
+            try:
+                cfg = await self.config.monitor()
+                h = int(cfg.get("cog_update_interval_h") or 0)
+                if h > 0:
+                    last = await self.config.monitor_last()
+                    due = int(last.get("checked_at") or 0) + h * 3600
+                    if time.time() >= due:
+                        await self._run_monitor(cfg)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.debug("Monitor-Durchlauf fehlgeschlagen", exc_info=True)
+            # Re-evaluate config/interval every 5 minutes (picks up changes quickly).
+            await asyncio.sleep(300)
+
+    async def _run_monitor(self, cfg: dict) -> None:
+        cogs: list = []
+        try:
+            dl = self.bot.get_cog("Downloader")
+            if dl is not None:
+                # Reuse the gateway's helpers (lazy import avoids a circular import).
+                from .gateway.methods import (
+                    _cogs_with_updates,
+                    _downloader_lock,
+                    _installed_cogs,
+                    _update_all_repos,
+                )
+                async with _downloader_lock:
+                    await _update_all_repos(dl)
+                    installed = await _installed_cogs(dl)
+                    cogs = sorted(await _cogs_with_updates(dl, installed))
+        except Exception:
+            log.debug("Cog-Update-Check fehlgeschlagen", exc_info=True)
+        await self.config.monitor_last.set({"cogs": cogs, "checked_at": int(time.time())})
+        if cfg.get("alerts_dm"):
+            await self._maybe_alert(cogs, cfg)
+
+    @staticmethod
+    def _rss_mb() -> Optional[int]:
+        try:
+            import os
+
+            import psutil  # Red ships psutil
+            return round(psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024))
+        except Exception:
+            return None
+
+    async def _dm_owners(self, text: str) -> None:
+        for oid in set(getattr(self.bot, "owner_ids", None) or []):
+            try:
+                user = self.bot.get_user(oid) or await self.bot.fetch_user(oid)
+                if user is not None:
+                    await user.send(text)
+            except Exception:
+                log.debug("Owner-DM fehlgeschlagen (%s)", oid, exc_info=True)
+
+    async def _maybe_alert(self, cogs: list, cfg: dict) -> None:
+        alerted = await self.config.monitor_alerted()
+        # 1) Cog updates – only DM when the set of updatable cogs changed.
+        if cogs and set(cogs) != set(alerted.get("cogs") or []):
+            await self._dm_owners(
+                f"🔔 **PDC Dashboard** — {len(cogs)} cog update(s) available: "
+                + ", ".join(cogs)
+                + "\nUpdate via the dashboard (Cogs) or `[p]cog update`."
+            )
+        alerted["cogs"] = cogs
+        # 2) Memory threshold – DM once when crossing, reset when back below.
+        thr = int(cfg.get("mem_threshold_mb") or 0)
+        mem = self._rss_mb()
+        if thr > 0 and mem is not None and mem >= thr:
+            if not alerted.get("mem"):
+                await self._dm_owners(f"⚠️ **PDC Dashboard** — high memory usage: {mem} MB (threshold {thr} MB).")
+                alerted["mem"] = True
+        elif alerted.get("mem"):
+            alerted["mem"] = False
+        await self.config.monitor_alerted.set(alerted)
 
     # ------------------------------------------------------------------ #
     # Public integration API (used by DashboardIntegration)
