@@ -65,7 +65,7 @@ class EventMessages(commands.Cog):
         self._selected_event = {}  # (guild_id, user_id) -> event_id
 
     def _get_dashboard_cog(self) -> Optional[commands.Cog]:
-        return self.bot.get_cog("WebDashboard") or self.bot.get_cog("Dashboard")
+        return self.bot.get_cog("pdc_webdashboard") or self.bot.get_cog("WebDashboard") or self.bot.get_cog("Dashboard")
 
     def _attach_to_dashboard(self, dashboard_cog: commands.Cog) -> bool:
         try:
@@ -98,7 +98,7 @@ class EventMessages(commands.Cog):
     async def on_cog_add(self, cog: commands.Cog) -> None:
         if self._dashboard_attached:
             return
-        if cog.qualified_name not in {"Dashboard", "WebDashboard"}:
+        if cog.qualified_name not in {"Dashboard", "WebDashboard", "pdc_webdashboard"}:
             return
         self._dashboard_attached = self._attach_to_dashboard(cog)
 

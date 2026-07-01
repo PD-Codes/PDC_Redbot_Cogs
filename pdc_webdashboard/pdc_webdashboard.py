@@ -28,7 +28,7 @@ DEFAULT_PORT = 6970
 
 
 @cog_i18n(_)
-class WebDashboard(commands.Cog):
+class WebDashboard(commands.Cog, name="pdc_webdashboard"):
     """Custom, modular web dashboard system for Red.
 
     Cogs hook in via integration (widgets + contextual panels) instead of

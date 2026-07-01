@@ -37,7 +37,7 @@ def _daykey(dt: Optional[datetime] = None) -> str:
     return (dt or _utcnow()).strftime("%Y-%m-%d")
 
 
-class WebDashboardStats(commands.Cog):
+class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
     """Server statistics for the PDC web dashboard."""
 
     def __init__(self, bot: Red) -> None:

@@ -313,7 +313,7 @@ class DashboardTemplate(commands.Cog):
     async def _status(self, ctx: commands.Context) -> None:
         """Show whether the WebDashboard cog is loaded (template self-check)."""
         lang = await self.config.guild(ctx.guild).language() if ctx.guild else "de-DE"
-        loaded = self.bot.get_cog("WebDashboard") is not None
+        loaded = (self.bot.get_cog("pdc_webdashboard") or self.bot.get_cog("WebDashboard")) is not None
         await ctx.send(tr_lang(
             lang,
             f"WebDashboard geladen: {loaded}. Panels: settings (Gilde), api (global).",

@@ -90,7 +90,7 @@ except Exception:  # pdc_webdashboard not installed
 
 def register_dashboard(cog) -> bool:
     """Call in ``cog_load``. Only integrates if WebDashboard is loaded."""
-    dashboard = cog.bot.get_cog("WebDashboard")
+    dashboard = cog.bot.get_cog("pdc_webdashboard") or cog.bot.get_cog("WebDashboard")
     if dashboard is None:
         return False
     dashboard.register_third_party(cog)
@@ -99,7 +99,7 @@ def register_dashboard(cog) -> bool:
 
 def unregister_dashboard(cog) -> None:
     """Call in ``cog_unload`` (always safe)."""
-    dashboard = cog.bot.get_cog("WebDashboard")
+    dashboard = cog.bot.get_cog("pdc_webdashboard") or cog.bot.get_cog("WebDashboard")
     if dashboard is not None:
         try:
             dashboard.unregister_third_party(cog)

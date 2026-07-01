@@ -99,7 +99,7 @@ async def _build_context(gateway: Any, params: Dict[str, Any]) -> DashboardConte
 
 async def _require(gateway: Any, ctx: DashboardContext, permission: str) -> None:
     # Lock: if the dashboard is locked, only the bot owner may run protected calls.
-    cog = gateway.bot.get_cog("WebDashboard")
+    cog = gateway.bot.get_cog("pdc_webdashboard") or gateway.bot.get_cog("WebDashboard")
     if cog is not None:
         try:
             if await cog.config.locked() and not await gateway.bot.is_owner(ctx.user):
@@ -798,7 +798,7 @@ async def cogs_set(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     # would terminate the gateway in the middle of the response.
     own_pkg = None
     try:
-        dcog = bot.get_cog("WebDashboard")
+        dcog = bot.get_cog("pdc_webdashboard") or bot.get_cog("WebDashboard")
         if dcog is not None:
             own_pkg = str(type(dcog).__module__).split(".")[0].lower()
     except Exception:
@@ -1338,7 +1338,7 @@ async def _do_cog_update(
     pkg = _loaded_pkg_name(bot, cog_name) or await _resolve_cog_name(bot, cog_name)
     own_pkg = None
     try:
-        dcog = bot.get_cog("WebDashboard")
+        dcog = bot.get_cog("pdc_webdashboard") or bot.get_cog("WebDashboard")
         if dcog is not None:
             own_pkg = str(type(dcog).__module__).split(".")[0].lower()
     except Exception:
@@ -1583,7 +1583,7 @@ async def settings_set(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
 # Dashboard-Branding, Overview, Lock, Sessions, Custom Pages
 # --------------------------------------------------------------------------- #
 def _dashboard_cog(gateway: Any):
-    return gateway.bot.get_cog("WebDashboard")
+    return gateway.bot.get_cog("pdc_webdashboard") or gateway.bot.get_cog("WebDashboard")
 
 
 @dispatcher.method("dashboard.branding")
@@ -1884,7 +1884,7 @@ async def pages_delete(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
 def _serverstats(gateway: Any):
     bot = gateway.bot
     # Current name first, then the legacy name (web_serverstats was renamed).
-    for cog_name in ("WebDashboardStats", "WebServerStats"):
+    for cog_name in ("pdc_webdashboard_stats", "WebDashboardStats", "WebServerStats"):
         cog = bot.get_cog(cog_name)
         if cog is not None:
             return cog

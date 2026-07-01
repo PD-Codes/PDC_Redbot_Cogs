@@ -121,7 +121,7 @@ class AdminProtocol(commands.Cog):
         self._selected_event = {}  # (guild_id, user_id, category) -> event_id
 
     async def cog_load(self) -> None:
-        dashboard = self.bot.get_cog("WebDashboard") or self.bot.get_cog("Dashboard")
+        dashboard = self.bot.get_cog("pdc_webdashboard") or self.bot.get_cog("WebDashboard") or self.bot.get_cog("Dashboard")
         if dashboard is not None:
             try:
                 dashboard.rpc.third_parties_handler.add_third_party(self, overwrite=True)
@@ -292,7 +292,7 @@ class AdminProtocol(commands.Cog):
 
     async def cog_unload(self) -> None:
         unregister_dashboard(self)
-        dashboard = self.bot.get_cog("WebDashboard") or self.bot.get_cog("Dashboard")
+        dashboard = self.bot.get_cog("pdc_webdashboard") or self.bot.get_cog("WebDashboard") or self.bot.get_cog("Dashboard")
         if dashboard is not None:
             try:
                 dashboard.rpc.third_parties_handler.remove_third_party(self)
@@ -313,7 +313,7 @@ class AdminProtocol(commands.Cog):
     async def on_cog_add(self, cog: commands.Cog) -> None:
         if self._dashboard_attached:
             return
-        if cog.qualified_name not in {"Dashboard", "WebDashboard"}:
+        if cog.qualified_name not in {"Dashboard", "WebDashboard", "pdc_webdashboard"}:
             return
         try:
             cog.rpc.third_parties_handler.add_third_party(self, overwrite=True)

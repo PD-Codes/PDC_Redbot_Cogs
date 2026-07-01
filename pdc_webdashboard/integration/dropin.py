@@ -100,7 +100,7 @@ def register_dashboard(cog) -> bool:
 
     Returns ``True`` if registration happened, otherwise ``False``.
     """
-    dashboard = cog.bot.get_cog("WebDashboard")
+    dashboard = cog.bot.get_cog("pdc_webdashboard") or cog.bot.get_cog("WebDashboard")
     if dashboard is None:
         return False
     dashboard.register_third_party(cog)
@@ -109,7 +109,7 @@ def register_dashboard(cog) -> bool:
 
 def unregister_dashboard(cog) -> None:
     """Call this in ``cog_unload`` (safe even if nothing was registered)."""
-    dashboard = cog.bot.get_cog("WebDashboard")
+    dashboard = cog.bot.get_cog("pdc_webdashboard") or cog.bot.get_cog("WebDashboard")
     if dashboard is not None:
         try:
             dashboard.unregister_third_party(cog)

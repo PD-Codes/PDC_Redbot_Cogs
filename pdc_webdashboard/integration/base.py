@@ -41,7 +41,7 @@ class DashboardIntegration:
         self._register_with_dashboard()
 
     def cog_unload(self) -> None:  # type: ignore[override]
-        dashboard = self.bot.get_cog("WebDashboard")
+        dashboard = self.bot.get_cog("pdc_webdashboard") or self.bot.get_cog("WebDashboard")
         if dashboard is not None:
             try:
                 dashboard.unregister_third_party(self)
@@ -52,7 +52,7 @@ class DashboardIntegration:
             parent_unload()
 
     def _register_with_dashboard(self) -> None:
-        dashboard = self.bot.get_cog("WebDashboard")
+        dashboard = self.bot.get_cog("pdc_webdashboard") or self.bot.get_cog("WebDashboard")
         if dashboard is None:
             # Dashboard not loaded yet - it will pick us up once it loads.
             log.debug("WebDashboard noch nicht geladen; Registrierung wird nachgeholt.")

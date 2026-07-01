@@ -126,7 +126,7 @@ class DashboardExample(commands.Cog):
         """Show whether the WebDashboard integration is available (example check)."""
         # Discord output -> tr_lang with the per-guild language setting.
         lang = await self.config.guild(ctx.guild).language() if ctx.guild else "de-DE"
-        loaded = self.bot.get_cog("WebDashboard") is not None
+        loaded = (self.bot.get_cog("pdc_webdashboard") or self.bot.get_cog("WebDashboard")) is not None
         await ctx.send(tr_lang(
             lang,
             f"WebDashboard-Integration: {'verfügbar' if DASHBOARD_AVAILABLE else 'nicht installiert'}; "
