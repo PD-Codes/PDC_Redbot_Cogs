@@ -37,7 +37,7 @@ class DashboardExample(commands.Cog):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=0xDA5B0A4D, force_registration=True)
         self.config.register_guild(
-            language="de-DE",  # per-guild language for this cog's Discord output
+            language="en-US",  # per-guild language for this cog's Discord output
             greeting={"enabled": False, "message": "Willkommen!", "channel": None},
         )
 
@@ -125,7 +125,7 @@ class DashboardExample(commands.Cog):
     async def _status(self, ctx: commands.Context) -> None:
         """Show whether the WebDashboard integration is available (example check)."""
         # Discord output -> tr_lang with the per-guild language setting.
-        lang = await self.config.guild(ctx.guild).language() if ctx.guild else "de-DE"
+        lang = await self.config.guild(ctx.guild).language() if ctx.guild else "en-US"
         loaded = (self.bot.get_cog("pdc_webdashboard") or self.bot.get_cog("WebDashboard")) is not None
         await ctx.send(tr_lang(
             lang,

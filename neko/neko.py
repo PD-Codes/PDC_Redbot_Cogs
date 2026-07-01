@@ -75,7 +75,7 @@ class Neko(commands.Cog):
 
     @settings_panel.on_submit
     async def _save_settings(self, ctx, data):
-        lang = str(data.get("language", "de-DE")).strip() or "de-DE"
+        lang = str(data.get("language", "en-US")).strip() or "en-US"
         await self.config.guild(ctx.guild).language.set(lang)
         return SubmitResult.ok(tr(ctx, "Gespeichert.", "Saved."))
 

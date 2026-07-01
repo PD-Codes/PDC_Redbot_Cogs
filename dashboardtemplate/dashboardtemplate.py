@@ -71,7 +71,7 @@ class DashboardTemplate(commands.Cog):
 
         # Per-guild settings (edited in the guild panel).
         self.config.register_guild(
-            language="de-DE",   # per-guild language of this cog (de-DE | en-US)
+            language="en-US",   # per-guild language of this cog (de-DE | en-US)
             enabled=False,
             greeting="Willkommen, {member}!",
             max_warns=3,
@@ -352,7 +352,7 @@ class DashboardTemplate(commands.Cog):
     )
     async def _status(self, ctx: commands.Context) -> None:
         """Show whether the WebDashboard cog is loaded (template self-check)."""
-        lang = await self.config.guild(ctx.guild).language() if ctx.guild else "de-DE"
+        lang = await self.config.guild(ctx.guild).language() if ctx.guild else "en-US"
         loaded = (self.bot.get_cog("pdc_webdashboard") or self.bot.get_cog("WebDashboard")) is not None
         await ctx.send(tr_lang(
             lang,
