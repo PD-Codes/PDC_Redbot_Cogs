@@ -20,6 +20,6 @@
     "hidden": false,
     "disabled": false,
     "type": "COG",
-    "install_msg": "Thanks for installing SocialFeed!\n\nLoad it with `[p]load socialfeed`, then configure it via its commands or the PDC web dashboard (if installed).",
+    "install_msg": "Thanks for installing SocialFeed!\n\nLoad it with `[p]load socialfeed`, then configure it via its commands or the PDC web dashboard (if installed).\n\nThis cog fetches external RSS/Atom feeds (e.g. YouTube, blogs, Reddit).",
     "end_user_data_statement": "This cog stores per-server feed configuration (feed URLs and target channels). It does not persistently store personal data about users."
 }

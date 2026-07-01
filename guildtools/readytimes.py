@@ -179,6 +179,7 @@ class ReadyTimes(commands.Cog):
 
     @app_commands.command(name="set-readytimes", description="Set/manage your raid availability privately.", extras={"i18n_desc": {"de-DE": "Deine Raid-Verfügbarkeit privat festlegen/verwalten.", "en-US": "Set/manage your raid availability privately."}})
     async def set_readytimes(self, interaction: discord.Interaction):
+        """Set your weekly ready times."""
         lang = await self._lang(interaction.guild)
         if not interaction.guild or not isinstance(interaction.user, (discord.Member,)):
             return await interaction.response.send_message(tr_lang(lang, "Nur in einem Server benutzbar.", "Only usable inside a server."), ephemeral=True)
@@ -211,6 +212,7 @@ class ReadyTimes(commands.Cog):
         end: Optional[str] = None,
         user: Optional[discord.Member] = None,
     ):
+        """Show recorded ready times."""
         lang = await self._lang(interaction.guild)
         if not interaction.guild:
             return await interaction.response.send_message(tr_lang(lang, "Nur in einem Server benutzbar.", "Only usable inside a server."), ephemeral=True)

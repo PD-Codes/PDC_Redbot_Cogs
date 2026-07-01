@@ -130,6 +130,7 @@ class GuildToolsPollExport(commands.Cog):
         extras={"i18n_desc": {"de-DE": "Native Discord-Umfrage als CSV exportieren (;-getrennt).", "en-US": "Export a native Discord poll as CSV (;-separated)."}}
     )
     async def export_poll(self, interaction: discord.Interaction, poll: str, mode: app_commands.Choice[str]):
+        """Export the results of a poll."""
         await interaction.response.defer(thinking=True, ephemeral=True)
         lang = await self._lang(interaction.guild)
 

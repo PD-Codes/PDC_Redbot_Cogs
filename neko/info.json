@@ -5,7 +5,7 @@
     "name": "Neko",
     "short": "Shows neko images and GIFs via nekos.best.",
     "description": "Shows random neko/anime images or GIFs from nekos.best. Supports categories, autocomplete, prefix & slash commands.",
-    "install_msg": "Neko cog installed! Use !neko or /neko.",
+    "install_msg": "Neko cog installed! Use !neko or /neko.\n\nThis cog fetches images from an outside service (Nekos.best API).",
     "required_cogs": {},
     "requirements": [],
     "tags": [

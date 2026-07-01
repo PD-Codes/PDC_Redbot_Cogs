@@ -144,6 +144,7 @@ class GuildTools(commands.Cog):
     @app_commands.guild_only()
     @app_commands.default_permissions(manage_guild=True)
     async def export_userlist(self, interaction: discord.Interaction):
+        """Export the server's member list."""
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
         lang = await self._lang(guild)
@@ -184,6 +185,7 @@ class GuildTools(commands.Cog):
     @app_commands.describe(von="Start date", bis="End date")
     @app_commands.guild_only()
     async def add_absence(self, interaction: discord.Interaction, von: str, bis: str):
+        """Add an absence entry for a member."""
         lang = await self._lang(interaction.guild)
         start, end = _parse_date(von), _parse_date(bis)
         if not start:
@@ -235,6 +237,7 @@ class GuildTools(commands.Cog):
     @app_commands.command(name="list-absence", description="Show your absences (ephemeral).", extras={"i18n_desc": {"de-DE": "Deine Abwesenheiten anzeigen (ephemer).", "en-US": "Show your absences (ephemeral)."}})
     @app_commands.guild_only()
     async def list_absence(self, interaction: discord.Interaction):
+        """List recorded absences."""
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
         lang = await self._lang(guild)
@@ -273,6 +276,7 @@ class GuildTools(commands.Cog):
     @app_commands.guild_only()
     @app_commands.default_permissions(manage_guild=True)
     async def get_absence(self, interaction: discord.Interaction):
+        """Show the absence entry for a member."""
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
         lang = await self._lang(guild)
@@ -325,6 +329,7 @@ class GuildTools(commands.Cog):
     @app_commands.guild_only()
     @app_commands.default_permissions(manage_guild=True)
     async def set_wow_defaults(self, interaction: discord.Interaction, region: str, realm: str):
+        """Set the default World of Warcraft region and realm for this server."""
         lang = await self._lang(interaction.guild)
         region = region.lower()
         if region not in {"eu", "us", "kr", "tw"}:
@@ -418,6 +423,7 @@ class GuildTools(commands.Cog):
     @app_commands.describe(charname="Character name", realm="Optional realm (otherwise the guild default)")
     @app_commands.guild_only()
     async def whois(self, interaction: discord.Interaction, charname: str, realm: str | None = None):
+        """Show information about a member."""
         await interaction.response.defer(ephemeral=True)
         lang = await self._lang(interaction.guild)
         gconf = self.config.guild(interaction.guild)

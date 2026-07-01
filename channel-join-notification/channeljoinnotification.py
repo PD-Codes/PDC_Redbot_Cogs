@@ -265,6 +265,7 @@ class ChannelJoinNotification(commands.Cog):
     )
     @app_commands.guild_only()
     async def join_notification(self, interaction: discord.Interaction) -> None:
+        """Configure the DM sent when members join a voice channel."""
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             lang = await self.config.guild(interaction.guild).language() if interaction.guild else "en-US"
             await interaction.response.send_message(

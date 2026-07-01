@@ -318,6 +318,7 @@ class ReactionRole(commands.Cog):
         emoji: str,
         role: discord.Role
     ):
+        """Add a reaction role to a message."""
         lang = await self.config.guild(ctx.guild).language()
         try:
             message_id = int(message_id)
@@ -373,6 +374,7 @@ class ReactionRole(commands.Cog):
     @commands.guild_only()
     @commands.has_permissions(manage_roles=True)
     async def reactionrole_remove(self, ctx: commands.Context, rr_id: str):
+        """Remove a reaction role from a message."""
         lang = await self.config.guild(ctx.guild).language()
         async with self.config.guild(ctx.guild).reactionroles() as data:
             if rr_id not in data:
@@ -396,6 +398,7 @@ class ReactionRole(commands.Cog):
     )
     @commands.guild_only()
     async def reactionrole_get(self, ctx: commands.Context):
+        """List the configured reaction roles."""
         lang = await self.config.guild(ctx.guild).language()
         data = await self.config.guild(ctx.guild).reactionroles()
 
@@ -476,6 +479,7 @@ class ReactionRole(commands.Cog):
     @commands.guild_only()
     @commands.has_permissions(manage_roles=True)
     async def reactionrole_sync(self, ctx: commands.Context):
+        """Re-sync reaction roles with their messages."""
         guild = ctx.guild
         lang = await self.config.guild(guild).language()
         data = await self.config.guild(guild).reactionroles()

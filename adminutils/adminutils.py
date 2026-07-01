@@ -180,6 +180,7 @@ class AdminUtils(commands.Cog):
         *,
         reason: Optional[str] = None
     ):
+        """Kick a member from the server."""
         await member.kick(reason=reason or f"Kicked by {ctx.author}")
         templates = await self.config.guild(ctx.guild).templates()
         await self._reply(
@@ -204,6 +205,7 @@ class AdminUtils(commands.Cog):
         *,
         reason: Optional[str] = None
     ):
+        """Ban a member from the server."""
         await ctx.guild.ban(
             member,
             reason=reason or f"Banned by {ctx.author}",
@@ -236,6 +238,7 @@ class AdminUtils(commands.Cog):
         *,
         reason: Optional[str] = None
     ):
+        """Time out (temporarily mute) a member."""
         until = discord.utils.utcnow() + timedelta(minutes=minutes)
         await member.timeout(until, reason=reason or f"Timeout by {ctx.author}")
         templates = await self.config.guild(ctx.guild).templates()
@@ -264,6 +267,7 @@ class AdminUtils(commands.Cog):
         *,
         except_users: Optional[str] = None
     ):
+        """Delete a number of recent messages in this channel."""
         lang = await self.config.guild(ctx.guild).language() if ctx.guild else "en-US"
         # 0) Defer immediately for slash/hybrid so nothing "hangs"
         deferred = False
@@ -426,6 +430,7 @@ class AdminUtils(commands.Cog):
         *,
         except_users: Optional[str] = None
     ):
+        """Quickly bulk-delete recent messages in this channel."""
         lang = await self.config.guild(ctx.guild).language() if ctx.guild else "en-US"
         # Defer slash/hybrid immediately so nothing "hangs"
         if getattr(ctx, "interaction", None) is not None:
@@ -517,6 +522,7 @@ class AdminUtils(commands.Cog):
         destination: discord.TextChannel,
         delete_original: Optional[bool] = True
     ):
+        """Move a message to another channel."""
         lang = await self.config.guild(ctx.guild).language() if ctx.guild else "en-US"
         mid = _parse_message_id(message)
         if mid is None:
@@ -592,6 +598,7 @@ class AdminUtils(commands.Cog):
         source_channel: discord.VoiceChannel,
         dest_channel: discord.VoiceChannel
     ):
+        """Move all members from one voice channel to another."""
         lang = await self.config.guild(ctx.guild).language() if ctx.guild else "en-US"
         if not ctx.interaction:
             return await self._reply(ctx, tr_lang(lang, "❌ Dieses Kommando nur als Slash möglich.", "❌ This command is only available as a slash command."))
@@ -632,6 +639,7 @@ class AdminUtils(commands.Cog):
         source_channel: discord.VoiceChannel,
         dest_channel: discord.VoiceChannel
     ):
+        """Move a member to another voice channel."""
         lang = await self.config.guild(ctx.guild).language() if ctx.guild else "en-US"
         if not ctx.interaction:
             return await self._reply(ctx, tr_lang(lang, "❌ Dieses Kommando nur als Slash möglich.", "❌ This command is only available as a slash command."))
@@ -784,6 +792,7 @@ class AdminUtils(commands.Cog):
         source_role: discord.Role,
         dest_role: discord.Role
     ):
+        """Copy a role's permission overwrites from one channel to another."""
         await interaction.response.defer(ephemeral=True)
         lang = await self.config.guild(interaction.guild).language() if interaction.guild else "en-US"
 
@@ -830,6 +839,7 @@ class AdminUtils(commands.Cog):
         source_role: discord.Role,
         target_role_name: str,
     ):
+        """Copy the settings of one role onto another."""
         await interaction.response.defer(ephemeral=True)
 
         guild = interaction.guild

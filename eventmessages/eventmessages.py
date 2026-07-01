@@ -266,6 +266,7 @@ class EventMessages(commands.Cog):
         event: str,                # <-- now required
         value: bool                # <-- now required
     ):
+        """Enable or disable event messages for this server."""
         await interaction.response.defer(ephemeral=True)
 
         guild = interaction.guild
@@ -313,6 +314,7 @@ class EventMessages(commands.Cog):
         event: str,                    # <-- now required
         channel: discord.TextChannel   # <-- required
     ):
+        """Set the channel where event messages are posted."""
         await interaction.response.defer(ephemeral=True)
         lang = await self.config.guild(interaction.guild).language() if interaction.guild else "en-US"
 
@@ -346,6 +348,7 @@ class EventMessages(commands.Cog):
         }},
     )
     async def em_status(self, interaction: discord.Interaction):
+        """Show the current event-message configuration."""
         await interaction.response.defer(ephemeral=True)
 
         guild = interaction.guild

@@ -5,7 +5,7 @@
     "name": "NekoAPI",
     "short": "Shows anime images from NekosAPI with a rating filter.",
     "description": "Fetches images and GIFs from https://nekosapi.com with rating support (safe, suggestive, borderline, explicit). Explicit is only allowed in NSFW channels.",
-    "install_msg": "Thanks for installing NekoAPI! Use !nekoapi or /nekoapi.",
+    "install_msg": "Thanks for installing NekoAPI! Use !nekoapi or /nekoapi.\n\nThis cog fetches images from an outside service (Nekosapi) and can return NSFW content depending on the rating you request.",
     "required_cogs": {},
     "requirements": [],
     "tags": [

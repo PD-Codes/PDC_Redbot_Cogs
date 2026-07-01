@@ -171,6 +171,7 @@ class Neko(commands.Cog):
         }},
     )
     async def neko_slash(self, interaction: discord.Interaction):
+        """Send a random anime image from the Nekos.best API."""
         await interaction.response.defer()
         lang = await self._lang(interaction)
         embed = await self.fetch_and_build_embed("neko", lang)
@@ -190,6 +191,7 @@ class Neko(commands.Cog):
     @app_commands.describe(category="Choose a category")
     @app_commands.autocomplete(category=neko_autocomplete)
     async def neko_cat_slash(self, interaction: discord.Interaction, category: str):
+        """Send a random category image from the Nekos.best API."""
         await interaction.response.defer()
         lang = await self._lang(interaction)
         embed = await self.fetch_and_build_embed(category, lang)

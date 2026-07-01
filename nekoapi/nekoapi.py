@@ -148,6 +148,7 @@ class NekoAPI(commands.Cog):
         }},
     )
     async def nekoapi_slash_safe(self, interaction: discord.Interaction):
+        """Send a random safe-for-work anime image from the Nekosapi service."""
         await interaction.response.defer()
         lang = await self._lang(interaction)
 
@@ -185,6 +186,7 @@ class NekoAPI(commands.Cog):
     @app_commands.describe(rating="Choose a rating")
     @app_commands.autocomplete(rating=rating_autocomplete)
     async def nekoapi_slash_rating(self, interaction: discord.Interaction, rating: str):
+        """Send a random anime image filtered by content rating from the Nekosapi service."""
         rating = rating.lower()
 
         await interaction.response.defer()
