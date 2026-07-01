@@ -6,7 +6,7 @@ As you can read from my grammar, you see the reason why :D
 
 ![Screenshot: PDC cogs overview](assets/readme-cogs-overview.png)
 
-> 📖 **Full documentation:** [PDC_Redbot_Cogs Wiki](https://github.com/pd-codes/PDC_Redbot_Cogs/wiki) (English & Deutsch)
+> 📖 **Full documentation:** [PDC_Redbot_Cogs Wiki](https://github.com/PD-Codes/PDC_Redbot_Cogs/wiki) (English & Deutsch)
 
 ## Status Information
 
@@ -22,7 +22,7 @@ As you can read from my grammar, you see the reason why :D
 ## PDC Web Dashboard (eigenes, modulares Web-Panel)
 
 Neben den AAA3A-kompatiblen Cogs gibt es ein **eigenes** Web-Dashboard. Die Web-App
-liegt im separaten Repo **https://github.com/pd-codes/PDC_Redbot_Webapp**; die Bot-Seite
+liegt im separaten Repo **https://github.com/PD-Codes/PDC_Redbot_Webapp**; die Bot-Seite
 besteht aus diesen Cogs hier:
 
 | Cog | Zweck |

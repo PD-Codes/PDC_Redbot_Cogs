@@ -29,8 +29,8 @@ Cogs (Widgets, Panels, Seiten). Das **Frontend** ist die separate SvelteKit-App
 ## Installation
 
 ```
-[p]repo add dks-redcogs <REPO_URL>
-[p]cog install dks-redcogs pdc_webdashboard
+[p]repo add pdc-cogs https://github.com/PD-Codes/PDC_Redbot_Cogs
+[p]cog install pdc-cogs pdc_webdashboard
 [p]load pdc_webdashboard
 ```
 
@@ -132,8 +132,8 @@ A custom, modular and secure web dashboard system for **Red-DiscordBot**. This c
 ## Install
 
 ```
-[p]repo add dks-redcogs <REPO_URL>
-[p]cog install dks-redcogs pdc_webdashboard
+[p]repo add pdc-cogs https://github.com/PD-Codes/PDC_Redbot_Cogs
+[p]cog install pdc-cogs pdc_webdashboard
 [p]load pdc_webdashboard
 ```
 
