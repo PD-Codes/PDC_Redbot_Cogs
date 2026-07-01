@@ -1,13 +1,23 @@
 {
-  "name": "ScheduledMsg",
-  "short": "Scheduled and recurring messages.",
-  "description": "Send messages once at a future time or on a recurring schedule (interval / daily / weekly). Opt-in per guild, bilingual (DE/EN), with web dashboard integration.",
-  "author": ["pd-codes"],
-  "required_cogs": {},
-  "requirements": [],
-  "tags": ["schedule", "reminder", "announcement", "utility", "dashboard"],
-  "min_bot_version": "3.5.0",
-  "hidden": false,
-  "disabled": false,
-  "type": "COG"
+    "name": "ScheduledMsg",
+    "short": "Scheduled and recurring messages.",
+    "description": "Send messages once at a future time or on a recurring schedule (interval / daily / weekly). Opt-in per guild, bilingual (DE/EN), with web dashboard integration.",
+    "author": [
+        "Domekologe"
+    ],
+    "required_cogs": {},
+    "requirements": [],
+    "tags": [
+        "schedule",
+        "reminder",
+        "announcement",
+        "utility",
+        "dashboard"
+    ],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG",
+    "install_msg": "Thanks for installing ScheduledMsg!\n\nLoad it with `[p]load scheduledmsg`, then configure it via its commands or the PDC web dashboard (if installed).",
+    "end_user_data_statement": "This cog stores per-server scheduled message configuration (content and timing). It does not persistently store personal data about users."
 }

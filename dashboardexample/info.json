@@ -1,10 +1,16 @@
 {
-    "author": ["pd-codes"],
+    "author": [
+        "Domekologe"
+    ],
     "name": "DashboardExample",
     "short": "Example cog for the PDC web dashboard integration.",
     "description": "Shows a widget (KPI) and a panel (form) for the PDC web dashboard. Integrates only when the WebDashboard cog is loaded, and works without it too.",
     "install_msg": "Also load `pdc_webdashboard` to see the integration in the web dashboard. Check with `[p]dashboardexample`.",
-    "tags": ["dashboard", "example", "web"],
+    "tags": [
+        "dashboard",
+        "example",
+        "web"
+    ],
     "requirements": [],
     "min_bot_version": "3.5.0",
     "type": "COG",

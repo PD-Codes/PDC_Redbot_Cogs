@@ -1,13 +1,23 @@
 {
-  "name": "StatChannels",
-  "short": "Live counter / stat voice channels (members, online, boosts …).",
-  "description": "Keep voice (or any) channel names updated with live server stats like member count, humans, bots, boosts. Opt-in per guild, bilingual (DE/EN), with web dashboard integration. Channel renames are rate-limit friendly (updated every ~10 minutes).",
-  "author": ["pd-codes"],
-  "required_cogs": {},
-  "requirements": [],
-  "tags": ["stats", "counter", "voice", "utility", "dashboard"],
-  "min_bot_version": "3.5.0",
-  "hidden": false,
-  "disabled": false,
-  "type": "COG"
+    "name": "StatChannels",
+    "short": "Live counter / stat voice channels (members, online, boosts …).",
+    "description": "Keep voice (or any) channel names updated with live server stats like member count, humans, bots, boosts. Opt-in per guild, bilingual (DE/EN), with web dashboard integration. Channel renames are rate-limit friendly (updated every ~10 minutes).",
+    "author": [
+        "Domekologe"
+    ],
+    "required_cogs": {},
+    "requirements": [],
+    "tags": [
+        "stats",
+        "counter",
+        "voice",
+        "utility",
+        "dashboard"
+    ],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG",
+    "install_msg": "Thanks for installing StatChannels!\n\nLoad it with `[p]load statchannels`, then configure it via its commands or the PDC web dashboard (if installed).",
+    "end_user_data_statement": "This cog stores per-server counter/stat channel configuration only. It does not persistently store personal data about users."
 }

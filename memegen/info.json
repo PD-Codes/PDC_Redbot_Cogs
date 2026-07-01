@@ -1,13 +1,21 @@
 {
-  "name": "MemeGen",
-  "short": "Post memes on command or on a timer.",
-  "description": "Fetch memes from meme-api.com (Reddit) on command, or auto-post into a channel on an interval. Configurable subreddit sources. Opt-in per guild, bilingual (DE/EN), with web dashboard integration.",
-  "author": ["pd-codes"],
-  "required_cogs": {},
-  "requirements": [],
-  "tags": ["fun", "meme", "dashboard"],
-  "min_bot_version": "3.5.0",
-  "hidden": false,
-  "disabled": false,
-  "type": "COG"
+    "name": "MemeGen",
+    "short": "Post memes on command or on a timer.",
+    "description": "Fetch memes from meme-api.com (Reddit) on command, or auto-post into a channel on an interval. Configurable subreddit sources. Opt-in per guild, bilingual (DE/EN), with web dashboard integration.",
+    "author": [
+        "Domekologe"
+    ],
+    "required_cogs": {},
+    "requirements": [],
+    "tags": [
+        "fun",
+        "meme",
+        "dashboard"
+    ],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG",
+    "install_msg": "Thanks for installing MemeGen!\n\nLoad it with `[p]load memegen`, then configure it via its commands or the PDC web dashboard (if installed).",
+    "end_user_data_statement": "This cog does not persistently store any personal data about users. It stores only per-server configuration."
 }

@@ -1,13 +1,23 @@
 {
-  "name": "EventLog",
-  "short": "Server event logging (joins/leaves, edits/deletes, roles, voice).",
-  "description": "Log server events to a channel: member joins/leaves, message edits/deletes, role and nickname changes, voice activity. Each event type can be toggled. Opt-in per guild, bilingual (DE/EN), with web dashboard integration.",
-  "author": ["pd-codes"],
-  "required_cogs": {},
-  "requirements": [],
-  "tags": ["logging", "moderation", "events", "utility", "dashboard"],
-  "min_bot_version": "3.5.0",
-  "hidden": false,
-  "disabled": false,
-  "type": "COG"
+    "name": "EventLog",
+    "short": "Server event logging (joins/leaves, edits/deletes, roles, voice).",
+    "description": "Log server events to a channel: member joins/leaves, message edits/deletes, role and nickname changes, voice activity. Each event type can be toggled. Opt-in per guild, bilingual (DE/EN), with web dashboard integration.",
+    "author": [
+        "Domekologe"
+    ],
+    "required_cogs": {},
+    "requirements": [],
+    "tags": [
+        "logging",
+        "moderation",
+        "events",
+        "utility",
+        "dashboard"
+    ],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG",
+    "install_msg": "Thanks for installing EventLog!\n\nLoad it with `[p]load eventlog`, then configure it via its commands or the PDC web dashboard (if installed).",
+    "end_user_data_statement": "This cog stores per-server logging configuration only. Logged events are posted to a Discord channel and are not persistently retained by the cog."
 }

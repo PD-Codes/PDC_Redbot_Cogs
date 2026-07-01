@@ -1,10 +1,17 @@
 {
-    "author": ["pd-codes"],
+    "author": [
+        "Domekologe"
+    ],
     "name": "DashboardTemplate",
     "short": "Template cog for the PDC web dashboard integration.",
     "description": "Annotated reference for wiring a cog into the PDC web dashboard: widget, guild panel (all field types) and global panel (owner). Does nothing productive on its own.",
     "install_msg": "Also load `pdc_webdashboard`. Check with `[p]dashboardtemplate`. Migration guide: README.md in the cog folder.",
-    "tags": ["dashboard", "template", "example", "web"],
+    "tags": [
+        "dashboard",
+        "template",
+        "example",
+        "web"
+    ],
     "requirements": [],
     "min_bot_version": "3.5.0",
     "type": "COG",

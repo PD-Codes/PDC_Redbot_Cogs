@@ -6,7 +6,7 @@
     "install_msg": "EventMessages loaded. Configure it with the em- slash commands or via the web dashboard.",
     "type": "COG",
     "author": [
-        "pd-codes"
+        "Domekologe"
     ],
     "min_bot_version": "3.5.0",
     "min_python_version": [

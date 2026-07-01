@@ -1,0 +1,9 @@
+{
+    "author": [
+        "Domekologe"
+    ],
+    "name": "PDC_Redbot_Cogs",
+    "short": "General (non-game) cogs for Red-DiscordBot by Domekologe.",
+    "description": "A collection of general-purpose cogs for Red-DiscordBot, including the PDC web dashboard and its integration framework (widgets, panels, pages). Game-specific cogs live in the separate PDC_Redbot_Game_Cogs repo.",
+    "install_msg": "Thanks for adding the PDC_Redbot_Cogs repo!\n\nBrowse cogs with `[p]cog list <repo>` and install one with `[p]cog install <repo> <cog>`."
+}
