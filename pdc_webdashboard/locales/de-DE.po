@@ -2,7 +2,7 @@
 msgid ""
 msgstr ""
 "Project-Id-Version: web-dashboard\n"
-"POT-Creation-Date: 2026-06-21 00:00+0000\n"
+"POT-Creation-Date: 2026-07-02 00:00+0000\n"
 "Last-Translator: \n"
 "Language-Team: Deutsch\n"
 "Language: de_DE\n"
@@ -15,45 +15,101 @@ msgid "Status: {state}"
 msgstr "Status: {state}"
 
 #: pdc_webdashboard.py
-msgid "läuft"
+msgid "running"
 msgstr "läuft"
 
 #: pdc_webdashboard.py
-msgid "gestoppt"
+msgid "stopped"
 msgstr "gestoppt"
 
 #: pdc_webdashboard.py
-msgid "Adresse: http://{host}:{port}"
+msgid "Address: http://{host}:{port}"
 msgstr "Adresse: http://{host}:{port}"
 
 #: pdc_webdashboard.py
-msgid "Registrierte Beiträge: {n} (aus {c} Cogs)"
+msgid "Registered contributions: {n} (from {c} cogs)"
 msgstr "Registrierte Beiträge: {n} (aus {c} Cogs)"
 
 #: pdc_webdashboard.py
-msgid "Start fehlgeschlagen: {error}"
+msgid "CORS origins: {origins}"
+msgstr "CORS-Origins: {origins}"
+
+#: pdc_webdashboard.py
+msgid "Request logging: {state}"
+msgstr "Request-Logging: {state}"
+
+#: pdc_webdashboard.py
+msgid "enabled"
+msgstr "aktiviert"
+
+#: pdc_webdashboard.py
+msgid "disabled"
+msgstr "deaktiviert"
+
+#: pdc_webdashboard.py
+msgid "Token auto-rotation: {value}"
+msgstr "Automatische Token-Rotation: {value}"
+
+#: pdc_webdashboard.py
+msgid "every {hours} h"
+msgstr "alle {hours} h"
+
+#: pdc_webdashboard.py
+msgid "Start failed: {error}"
 msgstr "Start fehlgeschlagen: {error}"
 
 #: pdc_webdashboard.py
-msgid "Gateway gestartet."
+msgid "Gateway started."
 msgstr "Gateway gestartet."
 
 #: pdc_webdashboard.py
-msgid "Gateway gestoppt."
+msgid "Gateway stopped."
 msgstr "Gateway gestoppt."
 
 #: pdc_webdashboard.py
-msgid "Gespeichert: {host}:{port}. Bitte neu starten."
-msgstr "Gespeichert: {host}:{port}. Bitte neu starten."
+msgid "Value must be between {min} and {max}."
+msgstr "Der Wert muss zwischen {min} und {max} liegen."
 
 #: pdc_webdashboard.py
-msgid "Token per DM gesendet."
+msgid "Saved: {host}:{port}. Restart the gateway to apply."
+msgstr "Gespeichert: {host}:{port}. Zum Übernehmen das Gateway neu starten."
+
+#: pdc_webdashboard.py
+msgid "No CORS origins configured."
+msgstr "Keine CORS-Origins konfiguriert."
+
+#: pdc_webdashboard.py
+msgid "CORS origins cleared."
+msgstr "CORS-Origins geleert."
+
+#: pdc_webdashboard.py
+msgid "Invalid origin. Use e.g. `https://dashboard.example.com`."
+msgstr "Ungültiger Origin. Nutze z. B. `https://dashboard.example.com`."
+
+#: pdc_webdashboard.py
+msgid "Added CORS origin: {origin}"
+msgstr "CORS-Origin hinzugefügt: {origin}"
+
+#: pdc_webdashboard.py
+msgid "Removed CORS origin: {origin}"
+msgstr "CORS-Origin entfernt: {origin}"
+
+#: pdc_webdashboard.py
+msgid "Unknown action. Use: list, add, remove, clear."
+msgstr "Unbekannte Aktion. Nutze: list, add, remove, clear."
+
+#: pdc_webdashboard.py
+msgid "Token sent via DM."
 msgstr "Token per DM gesendet."
 
 #: pdc_webdashboard.py
-msgid "Ich konnte dir keine DM senden. Bitte DMs aktivieren."
+msgid "I could not send you a DM. Please enable DMs."
 msgstr "Ich konnte dir keine DM senden. Bitte DMs aktivieren."
 
 #: pdc_webdashboard.py
-msgid "Neues Token erzeugt und Gateway neu gestartet. Hole es mit `[p]pdcdashboard token`."
-msgstr "Neues Token erzeugt und Gateway neu gestartet. Hole es mit `[p]pdcdashboard token`."
+msgid "New token generated and applied. Retrieve it with `[p]pdcdashboard token`."
+msgstr "Neues Token erzeugt und übernommen. Hole es mit `[p]pdcdashboard token`."
+
+#: pdc_webdashboard.py
+msgid "Automatic token rotation disabled."
+msgstr "Automatische Token-Rotation deaktiviert."

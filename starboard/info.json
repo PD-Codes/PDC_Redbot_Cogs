@@ -1,0 +1,22 @@
+{
+    "name": "Starboard",
+    "short": "Pin community favourites: reactions above a threshold get mirrored to a star channel.",
+    "description": "A classic starboard: when a message collects enough star reactions it is re-posted as an embed (author, content, image, star count, jump link) in a configurable star channel. Counts update live, posts are removed when they drop below the threshold (configurable), NSFW content is never mirrored to non-NSFW starboards. Bilingual (DE/EN), with web dashboard integration.",
+    "author": [
+        "Domekologe"
+    ],
+    "required_cogs": {},
+    "requirements": [],
+    "tags": [
+        "starboard",
+        "fun",
+        "engagement",
+        "dashboard"
+    ],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG",
+    "install_msg": "Thanks for installing Starboard!\n\nLoad it with `[p]load starboard`, set a channel with `[p]starboardset channel #channel`, then configure the rest via its commands or the PDC web dashboard (if installed).",
+    "end_user_data_statement": "This cog stores per-server starboard configuration plus, for each starred message, the message ID, channel ID, the author's Discord user ID and the current star count. Author IDs are anonymized on data deletion requests."
+}

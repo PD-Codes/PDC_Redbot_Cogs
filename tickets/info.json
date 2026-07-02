@@ -1,0 +1,22 @@
+{
+    "name": "Tickets",
+    "short": "Ticket-Tool-style support tickets with panels, transcripts and dashboard integration.",
+    "description": "Create ticket panels with an 'Open ticket' button. Tickets open as private threads or text channels, support staff can claim, close, reopen and delete tickets. On close a plain-text and HTML transcript is generated and posted to a log channel. Bilingual (DE/EN), with web dashboard integration (ticket overview, transcript viewer and settings panel).",
+    "author": [
+        "Domekologe"
+    ],
+    "required_cogs": {},
+    "requirements": [],
+    "tags": [
+        "tickets",
+        "support",
+        "moderation",
+        "dashboard"
+    ],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG",
+    "install_msg": "Thanks for installing Tickets!\n\nLoad it with `[p]load tickets`, then set it up with `[p]ticketset` (support roles, log channel, panels) or via the PDC web dashboard (if installed).",
+    "end_user_data_statement": "This cog stores per-guild ticket records containing Discord user IDs (ticket opener and claimer), channel IDs, timestamps and ticket status. On ticket close it stores message transcripts (author names, IDs and message content) as text/HTML files in the cog data folder. Records are pruned after a configurable retention period. Data deletion requests anonymize user IDs in ticket records; stored transcripts of closed tickets may still contain user messages until pruned."
+}

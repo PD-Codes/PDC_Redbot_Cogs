@@ -1,0 +1,24 @@
+{
+    "name": "AutoModPlus",
+    "short": "Anti-spam, anti-raid and regex filter (complements Red's Filter/Mod).",
+    "description": "Automatic moderation: message flood, duplicate/mention/emoji/attachment spam, invite and external link filters, ALL-CAPS detection, regex word filter with per-pattern actions, join-surge (raid) detection with alert/lockdown/kick responses and manual lockdown commands. Per-rule actions (delete/warn/timeout/kick/ban), exempt roles/channels, bilingual (DE/EN), web dashboard integration.",
+    "author": [
+        "Domekologe"
+    ],
+    "required_cogs": {},
+    "requirements": [],
+    "tags": [
+        "moderation",
+        "automod",
+        "antispam",
+        "antiraid",
+        "filter",
+        "dashboard"
+    ],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG",
+    "install_msg": "Thanks for installing AutoModPlus!\n\nLoad it with `[p]load automodplus`, then configure rules via `[p]automodplus` (alias `[p]amp`) or the PDC web dashboard (if installed). All rules are disabled by default.",
+    "end_user_data_statement": "This cog does not persistently store any personal data. Spam detection uses transient in-memory counters (timestamps and content hashes) that are discarded on unload/restart. Message content is never persisted."
+}

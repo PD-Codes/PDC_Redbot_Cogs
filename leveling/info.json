@@ -1,0 +1,24 @@
+{
+    "name": "Leveling",
+    "short": "MEE6-style leveling with XP, role rewards and a leaderboard.",
+    "description": "Award XP for messages and voice activity, with a MEE6-style level curve, level-up announcements, role rewards (stack or replace), no-XP channels/roles, rank cards and a paginated leaderboard. Opt-in per guild, bilingual (DE/EN), with web dashboard integration.",
+    "author": [
+        "Domekologe"
+    ],
+    "required_cogs": {},
+    "requirements": [],
+    "tags": [
+        "leveling",
+        "xp",
+        "ranks",
+        "fun",
+        "utility",
+        "dashboard"
+    ],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG",
+    "install_msg": "Thanks for installing Leveling!\n\nLoad it with `[p]load leveling`, enable it with `[p]levelset enable true`, then configure it via its commands or the PDC web dashboard (if installed).",
+    "end_user_data_statement": "This cog stores, per server, each member's accumulated XP and current level, keyed by their Discord user ID, plus server configuration. This data can be deleted on request."
+}

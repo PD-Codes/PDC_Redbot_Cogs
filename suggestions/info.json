@@ -1,0 +1,22 @@
+{
+    "name": "Suggestions",
+    "short": "Numbered suggestion system with vote reactions, staff review and DM notifications.",
+    "description": "Members submit suggestions with /suggest; each one becomes a numbered embed with upvote/downvote reactions (optionally with a discussion thread, optionally routed through a mod-review queue first). Staff approve/deny/consider suggestions with a reason — the embed is recolored, a status field is added and the suggester is notified via DM (best effort). Bilingual (DE/EN), with web dashboard integration.",
+    "author": [
+        "Domekologe"
+    ],
+    "required_cogs": {},
+    "requirements": [],
+    "tags": [
+        "suggestions",
+        "feedback",
+        "utility",
+        "dashboard"
+    ],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG",
+    "install_msg": "Thanks for installing Suggestions!\n\nLoad it with `[p]load suggestions`, set a channel with `[p]suggestset channel #channel`, then members can use `/suggest`. Configure the rest via commands or the PDC web dashboard (if installed).",
+    "end_user_data_statement": "This cog stores submitted suggestions per server: suggestion ID, the author's Discord user ID, the suggestion text, message ID, status and decision reason. Author IDs are anonymized on data deletion requests; users can export their own suggestions."
+}

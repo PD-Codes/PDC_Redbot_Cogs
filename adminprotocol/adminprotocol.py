@@ -1,15 +1,18 @@
 import logging
 import discord
+from discord import app_commands
 from redbot.core import Config, commands
-from typing import Any, Dict, List, Optional, Literal
+from redbot.core.utils.menus import DEFAULT_CONTROLS, menu
+from typing import Any, Deque, Dict, List, Optional, Literal
 from datetime import timedelta
+from collections import deque
 import asyncio
 import html
 import json
 
 from .pdc_dashboard import (
-    dashboard_widget, dashboard_panel, WidgetData,
-    PanelSchema, Field, SubmitResult,
+    dashboard_widget, dashboard_panel, dashboard_page, WidgetData,
+    PanelSchema, PageSchema, Field, Component, Control, SubmitResult,
     register_dashboard, unregister_dashboard,
     L, tr, tr_lang,
 )
@@ -119,6 +122,13 @@ class AdminProtocol(commands.Cog):
         self.config.register_guild(language="en-US", events=default_events)
         self._dashboard_attached = False
         self._selected_event = {}  # (guild_id, user_id, category) -> event_id
+        # Rate-limit protection: embeds are queued per channel and flushed in
+        # batches (up to 10 embeds per message) by a background task.
+        self._send_queues: Dict[int, List[discord.Embed]] = {}
+        self._queue_lock = asyncio.Lock()
+        self._flush_task: Optional[asyncio.Task] = None
+        # In-memory buffer of recent log entries per guild (for filtering).
+        self._recent: Dict[int, Deque[dict]] = {}
 
     async def cog_load(self) -> None:
         dashboard = self.bot.get_cog("pdc_webdashboard") or self.bot.get_cog("WebDashboard") or self.bot.get_cog("Dashboard")
@@ -218,16 +228,22 @@ class AdminProtocol(commands.Cog):
 
         cfg = events.get(submitted_ev, {}) if isinstance(events.get(submitted_ev), dict) else {}
 
-        # Save values
+        # Save values (validated: channel must belong to this guild).
         cfg["enabled"] = bool(data.get("enabled", False))
 
-        ch = data.get("channel")
-        cfg["channel"] = int(ch) if ch else None
+        ch = str(data.get("channel") or "").strip()
+        if ch.isdigit() and ctx.guild.get_channel(int(ch)) is not None:
+            cfg["channel"] = int(ch)
+        else:
+            cfg["channel"] = None
 
-        def _ids(raw):
+        def _ids(raw, limit=100):
+            # Sanitize ID lists from panel submits: digits only, deduped, capped.
             if isinstance(raw, list):
-                return [int(x) for x in raw if str(x).strip().isdigit()]
-            return [int(x.strip()) for x in str(raw or "").split(",") if x.strip().isdigit()]
+                vals = [int(x) for x in raw if str(x).strip().isdigit()]
+            else:
+                vals = [int(x.strip()) for x in str(raw or "")[:4000].split(",") if x.strip().isdigit()]
+            return list(dict.fromkeys(vals))[:limit]
 
         cfg["ignored_channels"] = _ids(data.get("ignored_channels", []))
         cfg["ignored_roles"] = _ids(data.get("ignored_roles", []))
@@ -291,6 +307,10 @@ class AdminProtocol(commands.Cog):
         return SubmitResult.ok(tr(ctx, "Gespeichert.", "Saved."))
 
     async def cog_unload(self) -> None:
+        if self._flush_task is not None:
+            self._flush_task.cancel()
+        # Best effort: drop pending queue content on unload.
+        self._send_queues.clear()
         unregister_dashboard(self)
         dashboard = self.bot.get_cog("pdc_webdashboard") or self.bot.get_cog("WebDashboard") or self.bot.get_cog("Dashboard")
         if dashboard is not None:
@@ -390,35 +410,93 @@ class AdminProtocol(commands.Cog):
             
         if await self._is_ignored(guild, event_name, channel=channel, member=member, role=role, actor=actor):
             return
-            
+
+        # Remember for the `recent` command / dashboard overview (in-memory).
+        buf = self._recent.setdefault(guild.id, deque(maxlen=300))
+        buf.append(
+            {
+                "ts": discord.utils.utcnow(),
+                "event": event_name,
+                "user_id": getattr(member, "id", None),
+                "actor_id": getattr(actor, "id", None),
+                "text": (embed.title or (embed.description or "").split("\n")[0])[:300],
+            }
+        )
+
         dest_channel = guild.get_channel(dest_channel_id)
         if dest_channel:
-            try:
-                await dest_channel.send(embed=embed)
-            except discord.Forbidden:
-                log.debug(f"Missing permissions to log to channel {dest_channel_id} for event {event_name}")
-            except Exception as e:
-                log.error(f"Error sending log embed: {e}")
+            await self._enqueue_embed(dest_channel.id, embed)
+
+    # ------------------------------------------------------------
+    # Rate-limit protection: queued, batched sending
+    # ------------------------------------------------------------
+
+    async def _enqueue_embed(self, channel_id: int, embed: discord.Embed) -> None:
+        """Queue an embed for the channel; a background task flushes batches."""
+        async with self._queue_lock:
+            self._send_queues.setdefault(channel_id, []).append(embed)
+            if self._flush_task is None or self._flush_task.done():
+                self._flush_task = asyncio.create_task(self._flush_loop())
+
+    async def _flush_loop(self) -> None:
+        """Flush queued embeds every ~2s, up to 10 embeds per message."""
+        try:
+            while True:
+                await asyncio.sleep(2.0)
+                async with self._queue_lock:
+                    batches = self._send_queues
+                    self._send_queues = {}
+                if not batches:
+                    return
+                for channel_id, embeds in batches.items():
+                    channel = self.bot.get_channel(channel_id)
+                    if channel is None:
+                        continue
+                    for i in range(0, len(embeds), 10):
+                        chunk = embeds[i : i + 10]
+                        try:
+                            await channel.send(embeds=chunk)
+                        except discord.Forbidden:
+                            log.debug("Missing permissions to log to channel %s", channel_id)
+                            break
+                        except discord.HTTPException as e:
+                            log.error("Error sending batched log embeds: %s", e)
+                        await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            pass
 
     async def _get_audit_log_entry(
         self,
         guild: discord.Guild,
         action: discord.AuditLogAction,
         target_id: Optional[int] = None,
-        max_age_seconds: float = 15.0
+        max_age_seconds: float = 15.0,
+        retries: int = 2,
+        retry_delay: float = 1.5,
     ) -> Optional[discord.AuditLogEntry]:
+        """Resolve the acting moderator for an event via the audit log.
+
+        Audit-log entries can arrive slightly after the gateway event, so the
+        lookup is retried a couple of times. Returns None gracefully when the
+        bot lacks the View Audit Log permission.
+        """
         try:
-            if not guild.me.guild_permissions.view_audit_log:
+            if guild.me is None or not guild.me.guild_permissions.view_audit_log:
                 return None
-            now = discord.utils.utcnow()
-            async for entry in guild.audit_logs(action=action, limit=5):
-                if target_id is not None and entry.target and entry.target.id != target_id:
-                    continue
-                age = (now - entry.created_at).total_seconds()
-                if age <= max_age_seconds:
-                    return entry
-        except Exception as e:
+            for attempt in range(max(1, retries)):
+                now = discord.utils.utcnow()
+                async for entry in guild.audit_logs(action=action, limit=5):
+                    if target_id is not None and entry.target and entry.target.id != target_id:
+                        continue
+                    age = (now - entry.created_at).total_seconds()
+                    if age <= max_age_seconds:
+                        return entry
+                if attempt + 1 < max(1, retries):
+                    await asyncio.sleep(retry_delay)
+        except (discord.Forbidden, discord.HTTPException) as e:
             log.debug(f"Failed to fetch audit log for action {action}: {e}")
+        except Exception as e:
+            log.debug(f"Unexpected audit log error for action {action}: {e}")
         return None
 
     def _is_mod_command(self, command_name: str, cog_name: Optional[str]) -> bool:
@@ -763,6 +841,9 @@ class AdminProtocol(commands.Cog):
     async def on_guild_channel_create(self, channel: discord.abc.GuildChannel):
         guild = channel.guild
         lang = await self.config.guild(guild).language()
+        # Resolve the acting moderator from the audit log (may be None).
+        entry = await self._get_audit_log_entry(guild, discord.AuditLogAction.channel_create, target_id=channel.id)
+        moderator = entry.user if entry else None
 
         embed = discord.Embed(
             color=0x2ecc71,
@@ -770,36 +851,49 @@ class AdminProtocol(commands.Cog):
             description=tr_lang(lang,
                         f"🌐 **Kanal:** {channel.mention if hasattr(channel, 'mention') else f'#{channel.name}'}\n"
                         f"🏷️ **Typ:** `{channel.type.name}`\n"
-                        f"🆔 **ID:** `{channel.id}`",
+                        f"🆔 **ID:** `{channel.id}`\n"
+                        f"🛡️ **Erstellt von:** {moderator.mention if moderator else 'Unbekannt'}",
                         f"🌐 **Channel:** {channel.mention if hasattr(channel, 'mention') else f'#{channel.name}'}\n"
                         f"🏷️ **Type:** `{channel.type.name}`\n"
-                        f"🆔 **ID:** `{channel.id}`")
+                        f"🆔 **ID:** `{channel.id}`\n"
+                        f"🛡️ **Created by:** {moderator.mention if moderator else 'Unknown'}")
         )
         embed.timestamp = discord.utils.utcnow()
         embed.set_footer(text="adminprotocol")
 
-        await self._post_embed(guild, "channel_create", embed, channel=channel)
+        await self._post_embed(guild, "channel_create", embed, channel=channel, actor=moderator)
 
     @commands.Cog.listener()
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
         guild = channel.guild
         lang = await self.config.guild(guild).language()
+        # BUGFIX: resolve WHICH moderator deleted the channel via the audit log
+        # (gracefully "Unknown" when View Audit Log is missing).
+        entry = await self._get_audit_log_entry(guild, discord.AuditLogAction.channel_delete, target_id=channel.id)
+        moderator = entry.user if entry else None
+        reason = entry.reason if entry and entry.reason else None
 
+        mod_de = moderator.mention if moderator else "Unbekannt (kein Audit-Log-Zugriff oder Eintrag)"
+        mod_en = moderator.mention if moderator else "Unknown (no audit-log access or entry)"
         embed = discord.Embed(
             color=0xe74c3c,
             title=tr_lang(lang, "🗑️ Kanal gelöscht", "🗑️ Channel deleted"),
             description=tr_lang(lang,
                         f"🌐 **Kanalname:** `#{channel.name}`\n"
                         f"🏷️ **Typ:** `{channel.type.name}`\n"
-                        f"🆔 **ID:** `{channel.id}`",
+                        f"🆔 **ID:** `{channel.id}`\n"
+                        f"🛡️ **Gelöscht von:** {mod_de}"
+                        + (f"\n📝 **Begründung:** {reason}" if reason else ""),
                         f"🌐 **Channel name:** `#{channel.name}`\n"
                         f"🏷️ **Type:** `{channel.type.name}`\n"
-                        f"🆔 **ID:** `{channel.id}`")
+                        f"🆔 **ID:** `{channel.id}`\n"
+                        f"🛡️ **Deleted by:** {mod_en}"
+                        + (f"\n📝 **Reason:** {reason}" if reason else ""))
         )
         embed.timestamp = discord.utils.utcnow()
         embed.set_footer(text="adminprotocol")
 
-        await self._post_embed(guild, "channel_delete", embed, channel=channel)
+        await self._post_embed(guild, "channel_delete", embed, channel=channel, actor=moderator)
 
     @commands.Cog.listener()
     async def on_guild_channel_update(self, before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
@@ -839,6 +933,8 @@ class AdminProtocol(commands.Cog):
     async def on_thread_create(self, thread: discord.Thread):
         guild = thread.guild
         lang = await self.config.guild(guild).language()
+        # Thread creator is available directly on the thread object.
+        creator = guild.get_member(thread.owner_id) if thread.owner_id else None
 
         embed = discord.Embed(
             color=0x2ecc71,
@@ -846,20 +942,25 @@ class AdminProtocol(commands.Cog):
             description=tr_lang(lang,
                         f"🌐 **Thread:** {thread.mention} ({thread.name})\n"
                         f"📁 **Kanal:** {thread.parent.mention if thread.parent else 'Unbekannt'}\n"
-                        f"🆔 **ID:** `{thread.id}`",
+                        f"🆔 **ID:** `{thread.id}`\n"
+                        f"👤 **Erstellt von:** {creator.mention if creator else (f'<@{thread.owner_id}>' if thread.owner_id else 'Unbekannt')}",
                         f"🌐 **Thread:** {thread.mention} ({thread.name})\n"
                         f"📁 **Channel:** {thread.parent.mention if thread.parent else 'Unknown'}\n"
-                        f"🆔 **ID:** `{thread.id}`")
+                        f"🆔 **ID:** `{thread.id}`\n"
+                        f"👤 **Created by:** {creator.mention if creator else (f'<@{thread.owner_id}>' if thread.owner_id else 'Unknown')}")
         )
         embed.timestamp = discord.utils.utcnow()
         embed.set_footer(text="adminprotocol")
 
-        await self._post_embed(guild, "thread_create", embed, channel=thread.parent)
+        await self._post_embed(guild, "thread_create", embed, channel=thread.parent, actor=creator)
 
     @commands.Cog.listener()
     async def on_thread_delete(self, thread: discord.Thread):
         guild = thread.guild
         lang = await self.config.guild(guild).language()
+        # Resolve the acting moderator from the audit log (may be None).
+        entry = await self._get_audit_log_entry(guild, discord.AuditLogAction.thread_delete, target_id=thread.id)
+        moderator = entry.user if entry else None
 
         embed = discord.Embed(
             color=0xe74c3c,
@@ -867,15 +968,17 @@ class AdminProtocol(commands.Cog):
             description=tr_lang(lang,
                         f"🌐 **Threadname:** `{thread.name}`\n"
                         f"📁 **Kanal:** {thread.parent.mention if thread.parent else 'Unbekannt'}\n"
-                        f"🆔 **ID:** `{thread.id}`",
+                        f"🆔 **ID:** `{thread.id}`\n"
+                        f"🛡️ **Gelöscht von:** {moderator.mention if moderator else 'Unbekannt'}",
                         f"🌐 **Thread name:** `{thread.name}`\n"
                         f"📁 **Channel:** {thread.parent.mention if thread.parent else 'Unknown'}\n"
-                        f"🆔 **ID:** `{thread.id}`")
+                        f"🆔 **ID:** `{thread.id}`\n"
+                        f"🛡️ **Deleted by:** {moderator.mention if moderator else 'Unknown'}")
         )
         embed.timestamp = discord.utils.utcnow()
         embed.set_footer(text="adminprotocol")
 
-        await self._post_embed(guild, "thread_delete", embed, channel=thread.parent)
+        await self._post_embed(guild, "thread_delete", embed, channel=thread.parent, actor=moderator)
 
     @commands.Cog.listener()
     async def on_thread_update(self, before: discord.Thread, after: discord.Thread):
@@ -915,39 +1018,49 @@ class AdminProtocol(commands.Cog):
     async def on_guild_role_create(self, role: discord.Role):
         guild = role.guild
         lang = await self.config.guild(guild).language()
+        # Resolve the acting moderator from the audit log (may be None).
+        entry = await self._get_audit_log_entry(guild, discord.AuditLogAction.role_create, target_id=role.id)
+        moderator = entry.user if entry else None
 
         embed = discord.Embed(
             color=0x2ecc71,
             title=tr_lang(lang, "🎨 Rolle angelegt", "🎨 Role created"),
             description=tr_lang(lang,
                         f"🏷️ **Rolle:** {role.mention} (`{role.name}`)\n"
-                        f"🆔 **ID:** `{role.id}`",
+                        f"🆔 **ID:** `{role.id}`\n"
+                        f"🛡️ **Erstellt von:** {moderator.mention if moderator else 'Unbekannt'}",
                         f"🏷️ **Role:** {role.mention} (`{role.name}`)\n"
-                        f"🆔 **ID:** `{role.id}`")
+                        f"🆔 **ID:** `{role.id}`\n"
+                        f"🛡️ **Created by:** {moderator.mention if moderator else 'Unknown'}")
         )
         embed.timestamp = discord.utils.utcnow()
         embed.set_footer(text="adminprotocol")
 
-        await self._post_embed(guild, "role_create", embed, role=role)
+        await self._post_embed(guild, "role_create", embed, role=role, actor=moderator)
 
     @commands.Cog.listener()
     async def on_guild_role_delete(self, role: discord.Role):
         guild = role.guild
         lang = await self.config.guild(guild).language()
+        # Resolve the acting moderator from the audit log (may be None).
+        entry = await self._get_audit_log_entry(guild, discord.AuditLogAction.role_delete, target_id=role.id)
+        moderator = entry.user if entry else None
 
         embed = discord.Embed(
             color=0xe74c3c,
             title=tr_lang(lang, "🗑️ Rolle gelöscht", "🗑️ Role deleted"),
             description=tr_lang(lang,
                         f"🏷️ **Rollenname:** `{role.name}`\n"
-                        f"🆔 **ID:** `{role.id}`",
+                        f"🆔 **ID:** `{role.id}`\n"
+                        f"🛡️ **Gelöscht von:** {moderator.mention if moderator else 'Unbekannt'}",
                         f"🏷️ **Role name:** `{role.name}`\n"
-                        f"🆔 **ID:** `{role.id}`")
+                        f"🆔 **ID:** `{role.id}`\n"
+                        f"🛡️ **Deleted by:** {moderator.mention if moderator else 'Unknown'}")
         )
         embed.timestamp = discord.utils.utcnow()
         embed.set_footer(text="adminprotocol")
 
-        await self._post_embed(guild, "role_delete", embed, role=role)
+        await self._post_embed(guild, "role_delete", embed, role=role, actor=moderator)
 
     @commands.Cog.listener()
     async def on_invite_create(self, invite: discord.Invite):
@@ -1153,6 +1266,290 @@ class AdminProtocol(commands.Cog):
             embed.set_footer(text="adminprotocol")
             
             await self._post_embed(interaction.guild, "mod_command", embed, channel=interaction.channel, actor=interaction.user)
+
+    # ------------------------------------------------------------
+    # Public hook for other cogs (e.g. AdminUtils)
+    # ------------------------------------------------------------
+
+    async def log_external_action(
+        self,
+        guild: discord.Guild,
+        *,
+        actor: Optional[discord.abc.User],
+        action: str,
+        target: Optional[discord.abc.User] = None,
+        reason: Optional[str] = None,
+        extra: Optional[str] = None,
+    ) -> None:
+        """Log a moderation action performed by another cog.
+
+        Other cogs call this via ``bot.get_cog("AdminProtocol")`` (optional
+        integration, no hard dependency). Posted under the ``mod_command``
+        event so guilds control it with the existing toggle.
+        """
+        try:
+            lang = await self.config.guild(guild).language()
+            lines_de = [f"🛠️ **Aktion:** `{action}`"]
+            lines_en = [f"🛠️ **Action:** `{action}`"]
+            if actor is not None:
+                lines_de.append(f"👤 **Moderator:** {actor.mention} ({actor.id})")
+                lines_en.append(f"👤 **Moderator:** {actor.mention} ({actor.id})")
+            if target is not None:
+                lines_de.append(f"🎯 **Ziel:** {target.mention} ({target.id})")
+                lines_en.append(f"🎯 **Target:** {target.mention} ({target.id})")
+            if reason:
+                lines_de.append(f"📝 **Begründung:** {reason}")
+                lines_en.append(f"📝 **Reason:** {reason}")
+            if extra:
+                lines_de.append(f"ℹ️ {extra}")
+                lines_en.append(f"ℹ️ {extra}")
+            embed = discord.Embed(
+                title=tr_lang(lang, "🛡️ Moderationsaktion", "🛡️ Moderation action"),
+                color=0xf1c40f,
+                description=tr_lang(lang, "\n".join(lines_de), "\n".join(lines_en)),
+            )
+            embed.timestamp = discord.utils.utcnow()
+            embed.set_footer(text="adminprotocol")
+            await self._post_embed(guild, "mod_command", embed, member=target, actor=actor)
+        except Exception as e:
+            log.debug("log_external_action failed: %s", e)
+
+    # ------------------------------------------------------------
+    # Commands (hybrid, admin tier)
+    # ------------------------------------------------------------
+
+    @commands.hybrid_group(name="adminprotocol", aliases=["ap"])
+    @commands.admin_or_permissions(manage_guild=True)
+    @commands.guild_only()
+    async def adminprotocol(self, ctx: commands.Context) -> None:
+        """Configure and inspect AdminProtocol event logging."""
+
+    @adminprotocol.command(name="status")
+    async def ap_status(self, ctx: commands.Context) -> None:
+        """Show all events with their state and log channel (paginated)."""
+        lang = await self.config.guild(ctx.guild).language()
+        events = await self.config.guild(ctx.guild).events()
+        rows: List[str] = []
+        for key, names in EVENTS.items():
+            cfg = events.get(key, {}) if isinstance(events.get(key), dict) else {}
+            state = "✅" if cfg.get("enabled") else "❌"
+            cid = cfg.get("channel")
+            ch = ctx.guild.get_channel(cid) if cid else None
+            label = tr_lang(lang, names[0], names[1])
+            rows.append(f"{state} **{label}** (`{key}`) → {ch.mention if ch else '—'}")
+        pages: List[discord.Embed] = []
+        per_page = 10
+        for i in range(0, len(rows), per_page):
+            emb = discord.Embed(
+                title=tr_lang(lang, "AdminProtocol — Ereignisse", "AdminProtocol — events"),
+                description="\n".join(rows[i : i + per_page]),
+                colour=await ctx.embed_colour(),
+            )
+            emb.set_footer(text=f"{i // per_page + 1}/{(len(rows) - 1) // per_page + 1}")
+            pages.append(emb)
+        if len(pages) == 1:
+            await ctx.send(embed=pages[0])
+        else:
+            await menu(ctx, pages, DEFAULT_CONTROLS)
+
+    @adminprotocol.command(name="toggle")
+    @app_commands.describe(event="Event key (see status)", on_off="Enable or disable this event")
+    async def ap_toggle(self, ctx: commands.Context, event: str, on_off: bool) -> None:
+        """Enable/disable a single event type."""
+        lang = await self.config.guild(ctx.guild).language()
+        event = event.lower()
+        if event not in EVENTS:
+            await ctx.send(tr_lang(lang, "Unbekanntes Ereignis. Siehe `adminprotocol status`.", "Unknown event. See `adminprotocol status`."))
+            return
+        async with self.config.guild(ctx.guild).events() as events:
+            cfg = events.get(event, {}) if isinstance(events.get(event), dict) else {}
+            cfg["enabled"] = on_off
+            cfg.setdefault("channel", None)
+            cfg.setdefault("ignored_channels", [])
+            cfg.setdefault("ignored_users", [])
+            cfg.setdefault("ignored_roles", [])
+            events[event] = cfg
+        await ctx.send(tr_lang(lang, "Gespeichert.", "Saved."))
+
+    @adminprotocol.command(name="channel")
+    @app_commands.describe(event="Event key (see status)", channel="Target log channel (omit to clear)")
+    async def ap_channel(
+        self, ctx: commands.Context, event: str, channel: Optional[discord.TextChannel] = None
+    ) -> None:
+        """Set (or clear) the log channel for an event."""
+        lang = await self.config.guild(ctx.guild).language()
+        event = event.lower()
+        if event not in EVENTS:
+            await ctx.send(tr_lang(lang, "Unbekanntes Ereignis. Siehe `adminprotocol status`.", "Unknown event. See `adminprotocol status`."))
+            return
+        async with self.config.guild(ctx.guild).events() as events:
+            cfg = events.get(event, {}) if isinstance(events.get(event), dict) else {}
+            cfg["channel"] = channel.id if channel else None
+            cfg.setdefault("enabled", False)
+            cfg.setdefault("ignored_channels", [])
+            cfg.setdefault("ignored_users", [])
+            cfg.setdefault("ignored_roles", [])
+            events[event] = cfg
+        if channel:
+            await ctx.send(tr_lang(lang, f"Log-Kanal: {channel.mention}", f"Log channel: {channel.mention}"))
+        else:
+            await ctx.send(tr_lang(lang, "Log-Kanal entfernt.", "Log channel cleared."))
+
+    @adminprotocol.command(name="language")
+    @app_commands.describe(language="Output language: de-DE or en-US")
+    async def ap_language(self, ctx: commands.Context, language: str) -> None:
+        """Set the output language for this server (default: en-US)."""
+        language = "de-DE" if language.lower().startswith("de") else "en-US"
+        await self.config.guild(ctx.guild).language.set(language)
+        await ctx.send(tr_lang(language, "Sprache: Deutsch", "Language: English"))
+
+    @adminprotocol.command(name="recent")
+    @app_commands.describe(
+        event="Optional event key filter",
+        member="Optional member filter (subject or moderator)",
+        minutes="Only entries from the last X minutes",
+    )
+    async def ap_recent(
+        self,
+        ctx: commands.Context,
+        event: Optional[str] = None,
+        member: Optional[discord.Member] = None,
+        minutes: Optional[commands.Range[int, 1, 10080]] = None,
+    ) -> None:
+        """Show recent logged events, filterable by event/member/time (paginated)."""
+        lang = await self.config.guild(ctx.guild).language()
+        entries = list(self._recent.get(ctx.guild.id, []))
+        if event:
+            event = event.lower()
+            if event not in EVENTS:
+                await ctx.send(tr_lang(lang, "Unbekanntes Ereignis. Siehe `adminprotocol status`.", "Unknown event. See `adminprotocol status`."))
+                return
+            entries = [x for x in entries if x["event"] == event]
+        if member is not None:
+            entries = [x for x in entries if member.id in (x.get("user_id"), x.get("actor_id"))]
+        if minutes is not None:
+            cutoff = discord.utils.utcnow() - timedelta(minutes=int(minutes))
+            entries = [x for x in entries if x["ts"] >= cutoff]
+        entries = entries[-100:][::-1]
+        if not entries:
+            await ctx.send(tr_lang(lang, "Keine passenden Einträge im Puffer.", "No matching entries in the buffer."))
+            return
+        pages: List[discord.Embed] = []
+        per_page = 10
+        for i in range(0, len(entries), per_page):
+            lines = []
+            for x in entries[i : i + per_page]:
+                names = EVENTS.get(x["event"], (x["event"], x["event"]))
+                label = tr_lang(lang, names[0], names[1])
+                lines.append(f"<t:{int(x['ts'].timestamp())}:t> **{label}** — {x['text']}")
+            emb = discord.Embed(
+                title=tr_lang(lang, "Letzte Ereignisse", "Recent events"),
+                description="\n".join(lines),
+                colour=await ctx.embed_colour(),
+            )
+            emb.set_footer(text=f"{i // per_page + 1}/{(len(entries) - 1) // per_page + 1}")
+            pages.append(emb)
+        if len(pages) == 1:
+            await ctx.send(embed=pages[0])
+        else:
+            await menu(ctx, pages, DEFAULT_CONTROLS)
+
+    # ------------------------------------------------------------
+    # PDC dashboard page (guild scope): overview
+    # ------------------------------------------------------------
+
+    @dashboard_page(
+        "overview",
+        L("AdminProtocol Übersicht", "AdminProtocol overview"),
+        scope="guild",
+        permission="guild_admin",
+        icon="shield",
+    )
+    async def overview_page(self, ctx):
+        params = getattr(ctx, "params", None) or {}
+        selected = str(params.get("category") or "all")
+        valid = {"all", *EVENT_CATEGORIES.keys()}
+        if selected not in valid:
+            selected = "all"
+
+        events = await self.config.guild(ctx.guild).events()
+        keys = (
+            list(EVENTS.keys())
+            if selected == "all"
+            else list(EVENT_CATEGORIES[selected][1])
+        )
+        rows = []
+        for key in keys:
+            cfg = events.get(key, {}) if isinstance(events.get(key), dict) else {}
+            names = EVENTS.get(key, (key, key))
+            cid = cfg.get("channel")
+            ch = ctx.guild.get_channel(cid) if cid else None
+            rows.append(
+                {
+                    "event": tr(ctx, names[0], names[1]),
+                    "enabled": "✅" if cfg.get("enabled") else "❌",
+                    "channel": f"#{ch.name}" if ch else "—",
+                    "ignores": str(
+                        len(cfg.get("ignored_channels", []))
+                        + len(cfg.get("ignored_users", []))
+                        + len(cfg.get("ignored_roles", []))
+                    ),
+                }
+            )
+
+        recent = list(self._recent.get(ctx.guild.id, []))[-25:][::-1]
+        recent_rows = []
+        for x in recent:
+            names = EVENTS.get(x["event"], (x["event"], x["event"]))
+            recent_rows.append(
+                {
+                    "time": x["ts"].strftime("%Y-%m-%d %H:%M:%S"),
+                    "event": tr(ctx, names[0], names[1]),
+                    "text": x["text"],
+                }
+            )
+
+        cat_labels_en = {
+            "messages": "Messages & Channels",
+            "members": "Members & Roles",
+            "moderation": "Moderation",
+            "voice": "Voice & Invites",
+        }
+        cat_options = [{"value": "all", "label": L("Alle Kategorien", "All categories")}]
+        for cat_key, (cat_de, _keys) in EVENT_CATEGORIES.items():
+            cat_options.append({"value": cat_key, "label": L(cat_de, cat_labels_en.get(cat_key, cat_de))})
+        controls = [Control.select("category", L("Kategorie", "Category"), cat_options, value=selected)]
+
+        comps = [
+            Component.heading(L("AdminProtocol Übersicht", "AdminProtocol overview")),
+            Component.text(
+                tr(
+                    ctx,
+                    "Status aller Log-Ereignisse und die letzten Einträge (In-Memory-Puffer).",
+                    "State of all log events and the most recent entries (in-memory buffer).",
+                )
+            ),
+            Component.table(
+                columns=[
+                    {"key": "event", "label": tr(ctx, "Ereignis", "Event")},
+                    {"key": "enabled", "label": tr(ctx, "Aktiv", "Enabled")},
+                    {"key": "channel", "label": tr(ctx, "Kanal", "Channel")},
+                    {"key": "ignores", "label": tr(ctx, "Ausnahmen", "Ignores")},
+                ],
+                rows=rows,
+                title=tr(ctx, "Ereignisse", "Events"),
+            ),
+            Component.table(
+                columns=[
+                    {"key": "time", "label": tr(ctx, "Zeit", "Time")},
+                    {"key": "event", "label": tr(ctx, "Ereignis", "Event")},
+                    {"key": "text", "label": tr(ctx, "Beschreibung", "Description")},
+                ],
+                rows=recent_rows,
+                title=tr(ctx, "Letzte Einträge", "Recent entries"),
+            ),
+        ]
+        return PageSchema(components=comps, controls=controls)
 
     # ------------------------------------------------------------
     # Standalone Dashboard Page

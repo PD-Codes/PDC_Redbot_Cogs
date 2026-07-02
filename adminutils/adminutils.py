@@ -2,7 +2,7 @@ import discord
 import asyncio
 from discord import app_commands
 from datetime import timedelta
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Literal, Optional, List
 from redbot.core import commands, Config
 from typing import Union
 import re
@@ -15,9 +15,11 @@ from .pdc_dashboard import (
     L, tr, tr_lang,
 )
 
+# URL detection for the purge "links" content filter.
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
-def has_perms(**perms):
-    return commands.has_permissions(**perms)
+# Valid purge content filters (used by purge/purgefast).
+PurgeFilter = Literal["bots", "embeds", "images", "links"]
 
 ChannelOrThread = Union[discord.TextChannel, discord.Thread]
 
@@ -58,7 +60,10 @@ class AdminUtils(commands.Cog):
                 "ban_success": "✅ {member} was banned. Reason: {reason} | Messages: {delete_days} days",
                 "timeout_success": "✅ {member} is in timeout for {minutes} minutes. Reason: {reason}",
                 "purge_success": "✅ {deleted} messages deleted. Exceptions: {exceptions}",
-            }
+            },
+            # Roles of softbanned users, kept for a potential restore:
+            # {str(user_id): {"roles": [role_id, ...], "name": str}}
+            softban_roles={},
         )
         self._dashboard_attached = False
 
@@ -168,10 +173,95 @@ class AdminUtils(commands.Cog):
         else:
             await ctx.reply(content, **{k: v for k, v in kwargs.items() if k != "ephemeral"})
 
+    async def _log_to_adminprotocol(
+        self,
+        guild: Optional[discord.Guild],
+        actor: discord.abc.User,
+        action: str,
+        target: Optional[discord.abc.User] = None,
+        reason: Optional[str] = None,
+        extra: Optional[str] = None,
+    ) -> None:
+        """Forward a moderation action to the AdminProtocol cog when loaded.
+
+        Purely optional integration — resolved at runtime via ``bot.get_cog``
+        so there is no hard dependency between the cogs.
+        """
+        if guild is None:
+            return
+        ap = self.bot.get_cog("AdminProtocol")
+        if ap is None:
+            return
+        hook = getattr(ap, "log_external_action", None)
+        if hook is None:
+            return
+        try:
+            await hook(guild, actor=actor, action=action, target=target, reason=reason, extra=extra)
+        except Exception:
+            pass
+
+    def _resolve_except_ids(self, ctx: commands.Context, except_users: Optional[str]) -> List[int]:
+        """Resolve a space-separated list of mentions/IDs/names to member IDs."""
+        except_ids: List[int] = []
+        if not except_users or not ctx.guild:
+            return except_ids
+        for u in except_users.split():
+            uid = None
+            if u.startswith("<@") and u.endswith(">"):
+                try:
+                    uid = int(u.strip("<@!>"))
+                except ValueError:
+                    uid = None
+            elif u.isdigit():
+                uid = int(u)
+            else:
+                u_lower = u.lower()
+                m = (
+                    discord.utils.find(lambda m: m.display_name.lower() == u_lower, ctx.guild.members)
+                    or discord.utils.find(lambda m: m.name.lower() == u_lower, ctx.guild.members)
+                    or discord.utils.find(lambda m: u_lower in m.display_name.lower(), ctx.guild.members)
+                    or discord.utils.find(lambda m: u_lower in m.name.lower(), ctx.guild.members)
+                )
+                if m:
+                    uid = m.id
+            if uid:
+                except_ids.append(uid)
+        return except_ids
+
+    @staticmethod
+    def _matches_content_filter(msg: discord.Message, content_filter: Optional[str]) -> bool:
+        """True when the message matches the requested purge content filter."""
+        if not content_filter:
+            return True
+        if content_filter == "bots":
+            return msg.author.bot
+        if content_filter == "embeds":
+            return bool(msg.embeds)
+        if content_filter == "images":
+            return any(
+                (a.content_type or "").startswith(("image/", "video/")) for a in msg.attachments
+            )
+        if content_filter == "links":
+            return bool(_URL_RE.search(msg.content or ""))
+        return True
+
+    def _build_purge_check(self, except_ids: List[int], content_filter: Optional[str]):
+        """Shared predicate for purge/purgefast (pins and exceptions are kept)."""
+
+        def _check(m: discord.Message) -> bool:
+            if m.pinned:
+                return False
+            if m.author.id in except_ids:
+                return False
+            return self._matches_content_filter(m, content_filter)
+
+        return _check
+
     # ---- KICK ----
     @commands.hybrid_command(name="kick", description="Kick a member.", extras={"i18n_desc": {"de-DE": "Ein Mitglied kicken.", "en-US": "Kick a member."}})
+    @commands.guild_only()
     @commands.bot_has_guild_permissions(kick_members=True)
-    @has_perms(kick_members=True)
+    @commands.mod_or_permissions(kick_members=True)
     @app_commands.describe(member="Member to kick", reason="Reason")
     async def kick(
         self,
@@ -187,11 +277,13 @@ class AdminUtils(commands.Cog):
             ctx,
             templates["kick_success"].format(member=member.mention, reason=reason or "—"),
         )
+        await self._log_to_adminprotocol(ctx.guild, ctx.author, "kick", target=member, reason=reason)
 
     # ---- BAN ----
     @commands.hybrid_command(name="ban", description="Ban a member.", extras={"i18n_desc": {"de-DE": "Ein Mitglied bannen.", "en-US": "Ban a member."}})
+    @commands.guild_only()
     @commands.bot_has_guild_permissions(ban_members=True)
-    @has_perms(ban_members=True)
+    @commands.mod_or_permissions(ban_members=True)
     @app_commands.describe(
         member="Member to ban",
         reason="Reason",
@@ -220,11 +312,13 @@ class AdminUtils(commands.Cog):
                 delete_days=delete_message_days,
             ),
         )
+        await self._log_to_adminprotocol(ctx.guild, ctx.author, "ban", target=member, reason=reason)
 
     # ---- TIMEOUT ----
     @commands.hybrid_command(name="timeout", description="Time out a member (in minutes).", extras={"i18n_desc": {"de-DE": "Ein Mitglied stummschalten (in Minuten).", "en-US": "Time out a member (in minutes)."}})
+    @commands.guild_only()
     @commands.bot_has_guild_permissions(moderate_members=True)
-    @has_perms(moderate_members=True)
+    @commands.mod_or_permissions(moderate_members=True)
     @app_commands.describe(
         member="Member",
         minutes="Duration in minutes",
@@ -250,79 +344,67 @@ class AdminUtils(commands.Cog):
                 reason=reason or "—",
             ),
         )
+        await self._log_to_adminprotocol(
+            ctx.guild, ctx.author, "timeout", target=member, reason=reason,
+            extra=f"{minutes} min",
+        )
 
 
-    # ---- PURGE (with exceptions) ----
-    @commands.hybrid_command(name="purge", description="Delete X messages, optionally with exceptions.", extras={"i18n_desc": {"de-DE": "X Nachrichten löschen, optional mit Ausnahmen.", "en-US": "Delete X messages, optionally with exceptions."}})
+    # ---- PURGE (with exceptions, content filters and dry-run) ----
+    @commands.hybrid_command(name="purge", description="Delete X messages, optionally filtered, with exceptions and dry-run.", extras={"i18n_desc": {"de-DE": "X Nachrichten löschen, optional gefiltert, mit Ausnahmen und Testlauf.", "en-US": "Delete X messages, optionally filtered, with exceptions and dry-run."}})
+    @commands.guild_only()
     @commands.bot_has_guild_permissions(manage_messages=True, read_message_history=True)
-    @has_perms(manage_messages=True)
+    @commands.mod_or_permissions(manage_messages=True)
     @app_commands.describe(
         amount="Number of messages (1-500)",
+        content_filter="Only delete: bots / embeds / images / links",
+        dry_run="Preview only — count matches without deleting",
         except_users="Users whose messages should not be deleted (mentions or IDs, separated by spaces)."
     )
     async def purge(
         self,
         ctx: commands.Context,
         amount: app_commands.Range[int, 1, 500],
+        content_filter: Optional[PurgeFilter] = None,
+        dry_run: Optional[bool] = False,
         *,
         except_users: Optional[str] = None
     ):
-        """Delete a number of recent messages in this channel."""
+        """Delete a number of recent messages in this channel.
+
+        Optional content filter (bots/embeds/images/links) and a dry-run
+        preview that only counts what would be deleted.
+        """
         lang = await self.config.guild(ctx.guild).language() if ctx.guild else "en-US"
         # 0) Defer immediately for slash/hybrid so nothing "hangs"
-        deferred = False
         if getattr(ctx, "interaction", None) is not None:
             try:
                 await ctx.interaction.response.defer(ephemeral=True, thinking=True)
-                deferred = True
             except discord.InteractionResponded:
                 pass  # already deferred
 
-        # 1) Collect exception IDs
-        except_ids: List[int] = []
-        if except_users:
-            for u in except_users.split():
-                uid = None
-                if u.startswith("<@") and u.endswith(">"):
-                    try:
-                        uid = int(u.strip("<@!>"))
-                    except ValueError:
-                        uid = None
-                elif u.isdigit():
-                    uid = int(u)
-                else:
-                    # Try several sensible matching variants
-                    u_lower = u.lower()
+        # 1) Collect exception IDs and the shared check
+        except_ids = self._resolve_except_ids(ctx, except_users)
+        _check = self._build_purge_check(except_ids, content_filter)
 
-                    # 1) Display name exact match
-                    m = discord.utils.find(lambda m: m.display_name.lower() == u_lower, ctx.guild.members)
-                    if m:
-                        uid = m.id
-                    else:
-                        # 2) Username exact match
-                        m = discord.utils.find(lambda m: m.name.lower() == u_lower, ctx.guild.members)
-                        if m:
-                            uid = m.id
-                        else:
-                            # 3) Display name contains (fuzzy)
-                            m = discord.utils.find(lambda m: u_lower in m.display_name.lower(), ctx.guild.members)
-                            if m:
-                                uid = m.id
-                            else:
-                                # 4) Username contains (fuzzy)
-                                m = discord.utils.find(lambda m: u_lower in m.name.lower(), ctx.guild.members)
-                                if m:
-                                    uid = m.id
-
-                if uid:
-                    except_ids.append(uid)
-
-        def _check(m: discord.Message) -> bool:
-            if m.pinned:
-                return False
-            if m.author.id in except_ids:
-                return False
-            return True
+        # 1b) Dry-run: preview only, nothing is deleted.
+        if dry_run:
+            matched = 0
+            authors: Dict[str, int] = {}
+            async for msg in ctx.channel.history(limit=amount, oldest_first=False):
+                if _check(msg):
+                    matched += 1
+                    authors[str(msg.author)] = authors.get(str(msg.author), 0) + 1
+            top = ", ".join(f"{name} ({n})" for name, n in sorted(authors.items(), key=lambda kv: -kv[1])[:5])
+            flt = content_filter or tr_lang(lang, "kein Filter", "no filter")
+            return await self._reply(
+                ctx,
+                tr_lang(
+                    lang,
+                    f"🔍 Testlauf: **{matched}** von {amount} Nachrichten würden gelöscht (Filter: {flt}, Ausnahmen: {len(except_ids)}).\nTop-Autoren: {top or '—'}",
+                    f"🔍 Dry run: **{matched}** of {amount} messages would be deleted (filter: {flt}, exceptions: {len(except_ids)}).\nTop authors: {top or '—'}",
+                ),
+            )
 
         total_target = amount
         total_deleted = 0
@@ -409,6 +491,12 @@ class AdminUtils(commands.Cog):
                 templates["purge_success"].format(deleted=total_deleted, exceptions=len(except_ids)),
             )
 
+        await self._log_to_adminprotocol(
+            ctx.guild, ctx.author, "purge",
+            extra=f"#{ctx.channel} • {total_deleted} deleted"
+            + (f" • filter={content_filter}" if content_filter else ""),
+        )
+
 
 
     # ---- Fast Purge (instant Purge but only for the last 14 days) ----
@@ -417,16 +505,19 @@ class AdminUtils(commands.Cog):
         description="Quickly deletes messages from the last 14 days (bulk).",
         extras={"i18n_desc": {"de-DE": "Löscht schnell Nachrichten der letzten 14 Tage (Bulk).", "en-US": "Quickly deletes messages from the last 14 days (bulk)."}}
     )
+    @commands.guild_only()
     @commands.bot_has_guild_permissions(manage_messages=True, read_message_history=True)
-    @has_perms(manage_messages=True)
+    @commands.mod_or_permissions(manage_messages=True)
     @app_commands.describe(
         amount="Number of messages (1-500)",
+        content_filter="Only delete: bots / embeds / images / links",
         except_users="Users whose messages should NOT be deleted (mentions or IDs, separated by spaces)."
     )
     async def purgefast(
         self,
         ctx: commands.Context,
         amount: app_commands.Range[int, 1, 500],
+        content_filter: Optional[PurgeFilter] = None,
         *,
         except_users: Optional[str] = None
     ):
@@ -439,52 +530,10 @@ class AdminUtils(commands.Cog):
             except discord.InteractionResponded:
                 pass
 
-        # Collect exception IDs (same scheme as the normal purge)
-        except_ids: List[int] = []
-        if except_users:
-            for u in except_users.split():
-                uid = None
-                if u.startswith("<@") and u.endswith(">"):
-                    try:
-                        uid = int(u.strip("<@!>"))
-                    except ValueError:
-                        uid = None
-                elif u.isdigit():
-                    uid = int(u)
-                else:
-                    # Try several sensible matching variants
-                    u_lower = u.lower()
-
-                    # 1) Display name exact match
-                    m = discord.utils.find(lambda m: m.display_name.lower() == u_lower, ctx.guild.members)
-                    if m:
-                        uid = m.id
-                    else:
-                        # 2) Username exact match
-                        m = discord.utils.find(lambda m: m.name.lower() == u_lower, ctx.guild.members)
-                        if m:
-                            uid = m.id
-                        else:
-                            # 3) Display name contains (fuzzy)
-                            m = discord.utils.find(lambda m: u_lower in m.display_name.lower(), ctx.guild.members)
-                            if m:
-                                uid = m.id
-                            else:
-                                # 4) Username contains (fuzzy)
-                                m = discord.utils.find(lambda m: u_lower in m.name.lower(), ctx.guild.members)
-                                if m:
-                                    uid = m.id
-
-                if uid:
-                    except_ids.append(uid)
-
-        def _check(m: discord.Message) -> bool:
-            if m.pinned:
-                return False
-            if m.author.id in except_ids:
-                return False
-            # IMPORTANT: Bulk only deletes messages <14 days - older ones are ignored by Discord.
-            return True
+        # Collect exception IDs (same scheme as the normal purge).
+        # NOTE: bulk deletion only covers messages <14 days (Discord limit).
+        except_ids = self._resolve_except_ids(ctx, except_users)
+        _check = self._build_purge_check(except_ids, content_filter)
 
         try:
             deleted = await ctx.channel.purge(
@@ -501,15 +550,21 @@ class AdminUtils(commands.Cog):
             ctx,
             tr_lang(lang, f"✅ {len(deleted)} Nachrichten (≤14 Tage) gelöscht. Ausnahmen: {len(except_ids)}", f"✅ {len(deleted)} messages (≤14 days) deleted. Exceptions: {len(except_ids)}")
         )
-        
+        await self._log_to_adminprotocol(
+            ctx.guild, ctx.author, "purgefast",
+            extra=f"#{ctx.channel} • {len(deleted)} deleted"
+            + (f" • filter={content_filter}" if content_filter else ""),
+        )
+
     # ---- MESSAGE MOVE (copy + optionally delete) ----
     @commands.hybrid_command(
         name="messagemove",
         description="Copies a message to a channel/thread and optionally deletes the original.",
         extras={"i18n_desc": {"de-DE": "Kopiert eine Nachricht in einen Ziel-Channel/Thread, optional Original löschen.", "en-US": "Copies a message to a channel/thread and optionally deletes the original."}}
     )
+    @commands.guild_only()
     @commands.bot_has_guild_permissions(manage_messages=True, read_message_history=True)
-    @has_perms(manage_messages=True)
+    @commands.mod_or_permissions(manage_messages=True)
     @app_commands.describe(
         message="Message ID or message link",
         destination="Target channel or thread",
@@ -586,8 +641,9 @@ class AdminUtils(commands.Cog):
         description="Move all members from one voice channel to another.",
         extras={"i18n_desc": {"de-DE": "Alle Mitglieder von einem Sprachkanal in einen anderen verschieben.", "en-US": "Move all members from one voice channel to another."}}
     )
+    @commands.guild_only()
     @commands.bot_has_guild_permissions(move_members=True)
-    @has_perms(move_members=True)
+    @commands.mod_or_permissions(move_members=True)
     @app_commands.describe(
         source_channel="Voice channel to move members from",
         dest_channel="Voice channel to move members to"
@@ -627,8 +683,9 @@ class AdminUtils(commands.Cog):
         description="Move selected members from one voice channel to another.",
         extras={"i18n_desc": {"de-DE": "Ausgewählte Mitglieder von einem Sprachkanal in einen anderen verschieben.", "en-US": "Move selected members from one voice channel to another."}}
     )
+    @commands.guild_only()
     @commands.bot_has_guild_permissions(move_members=True)
-    @has_perms(move_members=True)
+    @commands.mod_or_permissions(move_members=True)
     @app_commands.describe(
         source_channel="Voice channel to move members from",
         dest_channel="Voice channel to move members to"
@@ -773,13 +830,16 @@ class AdminUtils(commands.Cog):
         return copied, failed, had_overwrites
 
     # ---- COPY CHANNEL ROLE PERMISSIONS ----
-    @app_commands.command(
+    # Hybrid + Red admin tier: the previous bare app_commands.command silently
+    # ignored ext.commands permission checks, so anyone could run it.
+    @commands.hybrid_command(
         name="copy-channelrole",
         description="Copy a role's channel permissions to another role.",
         extras={"i18n_desc": {"de-DE": "Channel-Rechte einer Rolle auf eine andere Rolle kopieren.", "en-US": "Copy a role's channel permissions to another role."}}
     )
+    @commands.guild_only()
     @commands.bot_has_guild_permissions(manage_roles=True)
-    @has_perms(manage_roles=True)
+    @commands.admin_or_permissions(manage_roles=True)
     @app_commands.describe(
         channel="The channel whose permissions should be copied",
         source_role="Role to copy from",
@@ -787,38 +847,41 @@ class AdminUtils(commands.Cog):
     )
     async def copy_channelrole(
         self,
-        interaction: discord.Interaction,
+        ctx: commands.Context,
         channel: discord.abc.GuildChannel,
         source_role: discord.Role,
         dest_role: discord.Role
     ):
-        """Copy a role's permission overwrites from one channel to another."""
-        await interaction.response.defer(ephemeral=True)
-        lang = await self.config.guild(interaction.guild).language() if interaction.guild else "en-US"
+        """Copy a role's permission overwrites from one channel to another role."""
+        lang = await self.config.guild(ctx.guild).language() if ctx.guild else "en-US"
 
         overwrites = channel.overwrites.get(source_role)
         if overwrites is None:
-            return await interaction.followup.send(
+            return await self._reply(
+                ctx,
                 tr_lang(lang, f"❌ Die Rolle {source_role.mention} hat **keine spezifischen Overwrites** in {channel.mention}.", f"❌ The role {source_role.mention} has **no specific overwrites** in {channel.mention}."),
-                ephemeral=True
             )
 
         try:
             await channel.set_permissions(dest_role, overwrite=overwrites)
         except discord.Forbidden:
-            return await interaction.followup.send(
+            return await self._reply(
+                ctx,
                 tr_lang(lang, "❌ Ich habe nicht genügend Berechtigungen, um diese Permissions zu setzen.", "❌ I don't have enough permissions to set these permissions."),
-                ephemeral=True
             )
         except discord.HTTPException as e:
-            return await interaction.followup.send(
+            return await self._reply(
+                ctx,
                 tr_lang(lang, f"❌ Fehler von Discord: `{e}`", f"❌ Error from Discord: `{e}`"),
-                ephemeral=True
             )
 
-        await interaction.followup.send(
+        await self._reply(
+            ctx,
             tr_lang(lang, f"✅ Rechte von {source_role.mention} wurden für {channel.mention} → {dest_role.mention} kopiert.", f"✅ Permissions of {source_role.mention} were copied for {channel.mention} → {dest_role.mention}."),
-            ephemeral=True
+        )
+        await self._log_to_adminprotocol(
+            ctx.guild, ctx.author, "copy-channelrole",
+            extra=f"#{channel} • {source_role.name} → {dest_role.name}",
         )
 
     # ---- COPY GUILD ROLE ----

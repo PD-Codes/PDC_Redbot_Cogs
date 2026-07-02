@@ -21,7 +21,12 @@ LocalizedStr = Union[str, Dict[str, str]]
 
 
 def resolve_locale(value: "LocalizedStr", locale: Optional[str] = None) -> str:
-    """Resolve a localized string against `locale` (e.g. 'de-DE' / 'en-US')."""
+    """Resolve a localized string against `locale` (e.g. 'de-DE' / 'en-US').
+
+    When no locale is chosen (or the locale is unknown), the default is ALWAYS
+    en-US — never the first dict entry, which for ``L(de, en)`` would silently
+    make German the default.
+    """
     if not isinstance(value, dict):
         return value
     loc = str(locale or "en-US")
@@ -30,6 +35,12 @@ def resolve_locale(value: "LocalizedStr", locale: Optional[str] = None) -> str:
     lang = loc.split("-")[0].lower()
     for k, v in value.items():
         if str(k).split("-")[0].lower() == lang:
+            return v
+    # English fallback for unknown/unset locales.
+    if "en-US" in value:
+        return value["en-US"]
+    for k, v in value.items():
+        if str(k).split("-")[0].lower() == "en":
             return v
     return next(iter(value.values()), "")
 

@@ -7,11 +7,15 @@ Red config and queried by the WebDashboard gateway via public read methods
 Notes:
 - Bots are ignored for messages/voice/activity (user type = users).
 - Status/activity require the presence and member intents for complete data.
-- Old buckets are removed automatically after RETENTION_DAYS.
+- Old buckets are pruned automatically after the configured retention period
+  (``[p]pdcstats retention``; default 400 days).
 """
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
+import json
 import logging
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -24,9 +28,9 @@ from redbot.core.bot import Red
 
 log = logging.getLogger("red.pdc.pdc_webdashboard_stats")
 
-RETENTION_DAYS = 400          # how long daily buckets are kept
-SAMPLE_MINUTES = 30           # interval of the status/activity snapshots
-STATUS_RETENTION = 60 * 24 * 60 // SAMPLE_MINUTES  # ~60 days of status samples
+RETENTION_DAYS = 400          # default: how long daily buckets are kept (configurable)
+SAMPLE_MINUTES = 30           # default: interval of the status/activity snapshots (configurable)
+STATUS_SAMPLE_DAYS = 60       # how many days of status samples are kept
 
 
 def _utcnow() -> datetime:
@@ -35,6 +39,19 @@ def _utcnow() -> datetime:
 
 def _daykey(dt: Optional[datetime] = None) -> str:
     return (dt or _utcnow()).strftime("%Y-%m-%d")
+
+
+def _t(de: str, en: str) -> str:
+    """Bilingual command reply following Red's contextual locale.
+
+    The DEFAULT (no locale configured / unknown locale) is ALWAYS English.
+    """
+    try:
+        from redbot.core.i18n import get_locale
+        loc = str(get_locale() or "")
+    except Exception:
+        loc = ""
+    return de if loc.lower().startswith("de") else en
 
 
 class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
@@ -46,6 +63,10 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
         # (Config namespace) are preserved across the web_serverstats -> pdc_webdashboard_stats rename.
         self.config = Config.get_conf(
             self, identifier=0x57_57_53_01, force_registration=True, cog_name="WebServerStats"
+        )
+        self.config.register_global(
+            retention_days=RETENTION_DAYS,   # max age of daily buckets (owner-configurable)
+            sample_minutes=SAMPLE_MINUTES,   # snapshot interval (owner-configurable)
         )
         self.config.register_guild(
             enabled=True,
@@ -76,10 +97,33 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
         # Command usage: {(guild_id, daykey): {"cmds": {name: n}, "errs": {name: n}}}
         self._cmd_buf: Dict[Tuple[int, str], Dict[str, Any]] = {}
         self._enabled_cache: Dict[int, bool] = {}
+        # Cached copies of the global settings (loaded in cog_load).
+        self._retention_days: int = RETENTION_DAYS
+        self._sample_minutes: int = SAMPLE_MINUTES
         self._snapshot_loop.start()
         self._flush_loop.start()
 
+    @property
+    def _status_retention(self) -> int:
+        """Number of status samples to keep (~STATUS_SAMPLE_DAYS days)."""
+        return max(1, STATUS_SAMPLE_DAYS * 24 * 60 // max(1, self._sample_minutes))
+
     async def cog_load(self) -> None:
+        # Apply the configured retention/interval settings.
+        try:
+            self._retention_days = max(
+                30, min(int(await self.config.retention_days() or RETENTION_DAYS), 3650)
+            )
+            self._sample_minutes = max(
+                5, min(int(await self.config.sample_minutes() or SAMPLE_MINUTES), 1440)
+            )
+        except Exception:
+            log.debug("Loading global stats settings failed", exc_info=True)
+        if self._sample_minutes != SAMPLE_MINUTES:
+            try:
+                self._snapshot_loop.change_interval(minutes=self._sample_minutes)
+            except Exception:
+                log.debug("Applying snapshot interval failed", exc_info=True)
         # Reseed currently-open voice sessions + the enabled cache on (re)load.
         # IMPORTANT: on_ready does NOT fire on a cog reload (the bot is already
         # ready), so without this a [p]reload would lose all running voice sessions
@@ -492,14 +536,14 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
                     samples.append({
                         "t": _utcnow().isoformat(), "on": on, "idle": idle, "dnd": dnd, "off": off,
                     })
-                    del samples[:-STATUS_RETENTION]
+                    del samples[:-self._status_retention]
                 # Peak concurrency per day (max online + max in voice).
                 async with self.config.guild(guild).peaks() as pk:
                     day = pk.get(key) if isinstance(pk.get(key), dict) else {}
                     day["on_max"] = max(int(day.get("on_max", 0)), on)
                     day["voice_max"] = max(int(day.get("voice_max", 0)), voice_now)
                     pk[key] = day
-                # Activity per kind (each snapshot ≈ SAMPLE_MINUTES per active member).
+                # Activity per kind (each snapshot ≈ one sample interval per active member).
                 if any(kinds.values()):
                     async with self.config.guild(guild).activities() as actk:
                         day = actk.get(key) if isinstance(actk.get(key), dict) else {}
@@ -508,7 +552,7 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
                                 continue
                             kd = day.get(kind) if isinstance(day.get(kind), dict) else {}
                             for nm, count in names.items():
-                                kd[nm] = kd.get(nm, 0) + count * SAMPLE_MINUTES
+                                kd[nm] = kd.get(nm, 0) + count * self._sample_minutes
                             day[kind] = kd
                         actk[key] = day
                 # Legacy 'activity' store (playing only) – kept for backward compatibility.
@@ -516,7 +560,7 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
                     async with self.config.guild(guild).activity() as act_store:
                         day = act_store.get(key) if isinstance(act_store.get(key), dict) else {}
                         for nm, count in kinds["playing"].items():
-                            day[nm] = day.get(nm, 0) + count * SAMPLE_MINUTES
+                            day[nm] = day.get(nm, 0) + count * self._sample_minutes
                         act_store[key] = day
                 await self._prune(guild)
             except Exception:
@@ -530,7 +574,7 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
             days[key] = d
 
     async def _prune(self, guild: discord.Guild) -> None:
-        cutoff = _daykey(_utcnow() - timedelta(days=RETENTION_DAYS))
+        cutoff = _daykey(_utcnow() - timedelta(days=self._retention_days))
         for group in ("days", "msg_channels", "msg_members", "voice_channels", "voice_members",
                       "activity", "invite_daily", "commands", "command_errors",
                       "msg_hourly", "voice_hourly", "peaks", "activities"):
@@ -594,7 +638,7 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
     # Read API (called by the WebDashboard gateway)
     # ================================================================== #
     def _range_keys(self, days: int) -> List[str]:
-        days = max(1, min(int(days or 30), RETENTION_DAYS))
+        days = max(1, min(int(days or 30), self._retention_days))
         today = _utcnow().date()
         return [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days - 1, -1, -1)]
 
@@ -1043,4 +1087,219 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
             return {"joined": joined, "stayed": stayed, "rate": rate}
 
         return {"d7": bucket(7), "d30": bucket(30),
-                "note": "Basiert auf den letzten 500 erfassten Beitritten."}
+                "note": "Based on the last 500 recorded joins."}
+
+    async def stats_export(self, guild: discord.Guild, days: int = 30, fmt: str = "json") -> Dict[str, Any]:
+        """Export the collected statistics of ``guild`` as JSON or CSV.
+
+        Called by the ``[p]pdcstats export`` command AND by the gateway RPC
+        method ``serverstats.export``. Returns
+        ``{"filename": str, "mimetype": str, "content": str}``.
+        """
+        fmt = "csv" if str(fmt or "").lower() == "csv" else "json"
+        days = max(1, min(int(days or 30), self._retention_days))
+        keys = self._range_keys(days)
+        daysd = await self.config.guild(guild).days()
+        daysd = daysd if isinstance(daysd, dict) else {}
+        pk = await self.config.guild(guild).peaks()
+        pk = pk if isinstance(pk, dict) else {}
+        stamp = _utcnow().strftime("%Y%m%d")
+
+        def day(k: str) -> Dict[str, Any]:
+            d = daysd.get(k)
+            return d if isinstance(d, dict) else {}
+
+        def peak(k: str) -> Dict[str, Any]:
+            d = pk.get(k)
+            return d if isinstance(d, dict) else {}
+
+        if fmt == "csv":
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow([
+                "date", "messages", "joins", "leaves", "members",
+                "voice_minutes", "peak_online", "peak_voice",
+            ])
+            for k in keys:
+                d, p = day(k), peak(k)
+                writer.writerow([
+                    k,
+                    int(d.get("messages", 0)),
+                    int(d.get("joins", 0)),
+                    int(d.get("leaves", 0)),
+                    d.get("members", ""),
+                    round(float(d.get("voice_minutes", 0)), 1),
+                    int(p.get("on_max", 0)),
+                    int(p.get("voice_max", 0)),
+                ])
+            return {
+                "filename": f"stats_{guild.id}_{stamp}.csv",
+                "mimetype": "text/csv",
+                "content": buf.getvalue(),
+            }
+
+        async def store(name: str) -> Dict[str, Any]:
+            data = await getattr(self.config.guild(guild), name)()
+            data = data if isinstance(data, dict) else {}
+            return {k: data.get(k) for k in keys if k in data}
+
+        payload = {
+            "guild_id": str(guild.id),
+            "guild_name": guild.name,
+            "exported_at": _utcnow().isoformat(),
+            "days": days,
+            "daily": {k: day(k) for k in keys},
+            "peaks": {k: peak(k) for k in keys},
+            "msg_channels": await store("msg_channels"),
+            "msg_members": await store("msg_members"),
+            "voice_channels": await store("voice_channels"),
+            "voice_members": await store("voice_members"),
+            "commands": await store("commands"),
+            "command_errors": await store("command_errors"),
+        }
+        return {
+            "filename": f"stats_{guild.id}_{stamp}.json",
+            "mimetype": "application/json",
+            "content": json.dumps(payload, ensure_ascii=False, indent=2),
+        }
+
+    # ================================================================== #
+    # Commands
+    # ================================================================== #
+    # Permission model:
+    #   - Bot-level settings (retention, snapshot interval, manual prune)
+    #     -> bot owner only.
+    #   - Guild-facing settings/actions (collection toggle, export)
+    #     -> guild admin (Red admin role or Manage Guild). The bot owner
+    #       always passes Red's permission checks as well.
+    # The group itself is admin-gated so no regular user or mod can invoke
+    # anything below it.
+    @commands.admin_or_permissions(manage_guild=True)
+    @commands.group(name="pdcstats")
+    async def pdcstats_group(self, ctx: commands.Context) -> None:
+        """Manage the PDC dashboard statistics collection."""
+
+    @commands.is_owner()
+    @pdcstats_group.command(name="retention")
+    async def pdcstats_retention(self, ctx: commands.Context, days: Optional[int] = None) -> None:
+        """Show or set the data retention in days (30-3650). Bot owner only.
+
+        Old daily buckets are pruned automatically once they are older than
+        this. Lowering the value irreversibly deletes older datapoints on the
+        next pruning run.
+        """
+        if days is None:
+            await ctx.send(_t(
+                f"Aktuelle Aufbewahrung: {self._retention_days} Tage.",
+                f"Current retention: {self._retention_days} days.",
+            ))
+            return
+        if not 30 <= days <= 3650:
+            await ctx.send(_t(
+                "Der Wert muss zwischen 30 und 3650 liegen.",
+                "Value must be between 30 and 3650.",
+            ))
+            return
+        await self.config.retention_days.set(days)
+        self._retention_days = days
+        await ctx.send(_t(
+            f"Aufbewahrung auf {days} Tage gesetzt. Ältere Datenpunkte werden beim nächsten Lauf entfernt.",
+            f"Retention set to {days} days. Older datapoints are pruned on the next run.",
+        ))
+
+    @commands.is_owner()
+    @pdcstats_group.command(name="interval")
+    async def pdcstats_interval(self, ctx: commands.Context, minutes: Optional[int] = None) -> None:
+        """Show or set the snapshot interval in minutes (5-1440). Bot owner only.
+
+        Controls how often member status, activities and peak concurrency are
+        sampled. Applied immediately (no reload required).
+        """
+        if minutes is None:
+            await ctx.send(_t(
+                f"Aktuelles Snapshot-Intervall: {self._sample_minutes} Minuten.",
+                f"Current snapshot interval: {self._sample_minutes} minutes.",
+            ))
+            return
+        if not 5 <= minutes <= 1440:
+            await ctx.send(_t(
+                "Der Wert muss zwischen 5 und 1440 liegen.",
+                "Value must be between 5 and 1440.",
+            ))
+            return
+        await self.config.sample_minutes.set(minutes)
+        self._sample_minutes = minutes
+        try:
+            self._snapshot_loop.change_interval(minutes=minutes)
+        except Exception:
+            log.debug("Applying snapshot interval failed", exc_info=True)
+        await ctx.send(_t(
+            f"Snapshot-Intervall auf {minutes} Minuten gesetzt.",
+            f"Snapshot interval set to {minutes} minutes.",
+        ))
+
+    @commands.is_owner()
+    @pdcstats_group.command(name="prunenow")
+    async def pdcstats_prunenow(self, ctx: commands.Context) -> None:
+        """Prune datapoints older than the retention period NOW (all guilds). Bot owner only."""
+        pruned = 0
+        async with ctx.typing():
+            for guild in list(self.bot.guilds):
+                try:
+                    await self._prune(guild)
+                    pruned += 1
+                except Exception:
+                    log.debug("Manual prune failed for guild %s", guild.id, exc_info=True)
+        await ctx.send(_t(
+            f"Bereinigung abgeschlossen ({pruned} Server).",
+            f"Pruning finished ({pruned} guilds).",
+        ))
+
+    @commands.guild_only()
+    @commands.admin_or_permissions(manage_guild=True)
+    @pdcstats_group.command(name="toggle")
+    async def pdcstats_toggle(self, ctx: commands.Context, enabled: Optional[bool] = None) -> None:
+        """Show or set whether statistics are collected on THIS server. Guild admin."""
+        if enabled is None:
+            state = bool(await self.config.guild(ctx.guild).enabled())
+            await ctx.send(_t(
+                f"Statistik-Erfassung ist hier {'aktiviert' if state else 'deaktiviert'}.",
+                f"Statistics collection is {'enabled' if state else 'disabled'} here.",
+            ))
+            return
+        await self.config.guild(ctx.guild).enabled.set(bool(enabled))
+        self._enabled_cache[ctx.guild.id] = bool(enabled)
+        await ctx.send(_t(
+            f"Statistik-Erfassung {'aktiviert' if enabled else 'deaktiviert'}.",
+            f"Statistics collection {'enabled' if enabled else 'disabled'}.",
+        ))
+
+    @commands.guild_only()
+    @commands.admin_or_permissions(manage_guild=True)
+    @pdcstats_group.command(name="export")
+    async def pdcstats_export(self, ctx: commands.Context, fmt: str = "json", days: int = 30) -> None:
+        """Export this server's statistics as a JSON or CSV file. Guild admin.
+
+        ``fmt``: json (full stores) or csv (daily summary). ``days``: range.
+        """
+        fmt = str(fmt or "json").lower()
+        if fmt not in ("json", "csv"):
+            await ctx.send(_t(
+                "Unbekanntes Format. Nutze: json oder csv.",
+                "Unknown format. Use: json or csv.",
+            ))
+            return
+        async with ctx.typing():
+            result = await self.stats_export(ctx.guild, days=days, fmt=fmt)
+            data = result["content"].encode("utf-8")
+            if len(data) > 8 * 1024 * 1024:
+                await ctx.send(_t(
+                    "Export ist zu groß für Discord. Bitte weniger Tage wählen.",
+                    "Export is too large for Discord. Please choose fewer days.",
+                ))
+                return
+            file = discord.File(io.BytesIO(data), filename=result["filename"])
+        await ctx.send(
+            _t("Hier ist dein Statistik-Export:", "Here is your statistics export:"),
+            file=file,
+        )

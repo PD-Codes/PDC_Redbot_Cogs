@@ -46,7 +46,7 @@ class DashboardIntegration:
             try:
                 dashboard.unregister_third_party(self)
             except Exception:
-                log.exception("Fehler beim Abmelden vom WebDashboard")
+                log.exception("Failed to unregister from WebDashboard")
         parent_unload = getattr(super(), "cog_unload", None)
         if parent_unload is not None:
             parent_unload()
@@ -55,9 +55,9 @@ class DashboardIntegration:
         dashboard = self.bot.get_cog("pdc_webdashboard") or self.bot.get_cog("WebDashboard")
         if dashboard is None:
             # Dashboard not loaded yet - it will pick us up once it loads.
-            log.debug("WebDashboard noch nicht geladen; Registrierung wird nachgeholt.")
+            log.debug("WebDashboard not loaded yet; registration will be picked up later.")
             return
         try:
             dashboard.register_third_party(self)
         except Exception:
-            log.exception("Fehler beim Registrieren am WebDashboard")
+            log.exception("Failed to register with WebDashboard")

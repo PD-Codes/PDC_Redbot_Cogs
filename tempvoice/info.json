@@ -1,0 +1,23 @@
+{
+    "author": [
+        "Domekologe"
+    ],
+    "name": "tempvoice",
+    "short": "Join-to-create temporary voice channels (VoiceMaster style).",
+    "description": "Designate creator voice channels: joining one spawns a personal temp voice channel with the joining user as owner. Owners manage their channel via slash commands or an interactive button panel (rename, limit, lock, hide, transfer, claim, kick). Channels are auto-deleted when empty, restart-safe cleanup included. Bilingual (DE/EN), with web dashboard integration.",
+    "required_cogs": {},
+    "requirements": [],
+    "tags": [
+        "voice",
+        "tempvoice",
+        "join-to-create",
+        "utility",
+        "dashboard"
+    ],
+    "type": "COG",
+    "hidden": false,
+    "disabled": false,
+    "min_bot_version": "3.5.0",
+    "end_user_data_statement": "This cog stores per-server configuration (creator channel settings) and, while a temporary voice channel exists, the Discord user ID of its current owner. Ownership data is deleted as soon as the temporary channel is removed.",
+    "install_msg": "Thanks for installing TempVoice!\n\nLoad it with `[p]load tempvoice`, then add a creator channel with `[p]tempvoiceset creator add` or via the PDC web dashboard (if installed)."
+}

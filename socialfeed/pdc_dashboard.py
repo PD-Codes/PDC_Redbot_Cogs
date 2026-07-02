@@ -1,8 +1,8 @@
 """Drop-in hook for the PDC web dashboard integration (no hard dependency).
 
 This file can be copied unchanged into every cog. It also works when the
-``pdc_webdashboard`` cog is not installed (the decorators then become no-ops) and can
-be used alongside the AAA3A dashboard.
+``pdc_webdashboard`` cog is not installed (the decorators then become no-ops)
+and can be used alongside the AAA3A dashboard.
 """
 from __future__ import annotations
 
@@ -29,9 +29,9 @@ try:
 
     DASHBOARD_AVAILABLE = True
 
-    # Guarantee `.on_submit` exists even if the *installed* pdc_webdashboard is older
-    # than this drop-in (older builds did not attach the helper). Keeps the cog
-    # loadable regardless of the running pdc_webdashboard version.
+    # Guarantee the helper attributes exist even if the *installed*
+    # pdc_webdashboard is older than this drop-in (older builds did not attach
+    # them). Keeps the cog loadable regardless of the running version.
     _real_dashboard_panel = dashboard_panel  # type: ignore[has-type]
 
     def dashboard_panel(*_a, **_k):  # type: ignore[no-redef]
@@ -43,6 +43,20 @@ try:
                 def on_submit(_sub):
                     return _sub
                 func.on_submit = on_submit  # type: ignore[attr-defined]
+            return func
+
+        return _wrap
+
+    _real_dashboard_list = dashboard_list  # type: ignore[has-type]
+
+    def dashboard_list(*_a, **_k):  # type: ignore[no-redef]
+        _deco = _real_dashboard_list(*_a, **_k)
+
+        def _wrap(func):
+            func = _deco(func)
+            for _attr in ("on_delete", "edit_form", "on_edit"):
+                if not hasattr(func, _attr):
+                    setattr(func, _attr, lambda sub: sub)
             return func
 
         return _wrap
@@ -67,12 +81,12 @@ except Exception:  # pdc_webdashboard not installed
 
     def _noop_list(*_args, **_kwargs):
         def deco(func):
-            def _passthrough(f):
-                return f
+            def _passthrough(sub):
+                return sub
 
-            func.on_delete = _passthrough  # type: ignore[attr-defined]
-            func.edit_form = _passthrough  # type: ignore[attr-defined]
-            func.on_edit = _passthrough  # type: ignore[attr-defined]
+            func.on_delete = _passthrough
+            func.edit_form = _passthrough
+            func.on_edit = _passthrough
             return func
 
         return deco
@@ -82,6 +96,8 @@ except Exception:  # pdc_webdashboard not installed
     dashboard_list = _noop_list  # type: ignore
 
     class _Stub:
+        """Placeholder for the dashboard data classes when no dashboard is loaded."""
+
         def __init__(self, *_a, **_k):
             ...
 
@@ -92,19 +108,23 @@ except Exception:  # pdc_webdashboard not installed
         def _factory(cls, *_a, **_k):
             return cls()
 
+        # common constructors used by widgets / pages
         kpi = list = chart = status = markdown = ok = fail = _factory  # type: ignore
+        heading = text = divider = table = grid = select = _factory  # type: ignore
 
     WidgetData = PanelSchema = PageSchema = Field = Component = Control = SubmitResult = _Stub  # type: ignore
     DashboardContext = object  # type: ignore
 
+    # NOTE: en-US is the default language whenever no explicit choice exists.
     def L(de, en=None):
-        return de
+        return en if en is not None else de
 
     def tr(ctx, de, en):
-        return de
+        loc = str(getattr(ctx, "locale", "") or "")
+        return de if loc.lower().startswith("de") else en
 
     def tr_lang(lang, de, en):
-        return de
+        return de if str(lang or "").lower().startswith("de") else en
 
 
 def register_dashboard(cog) -> bool:

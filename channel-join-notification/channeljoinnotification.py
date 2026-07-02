@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 import html
 import json
@@ -10,6 +11,7 @@ import discord
 from discord import app_commands
 from redbot.core import Config, commands
 from redbot.core.bot import Red
+from redbot.core.utils.menus import DEFAULT_CONTROLS, menu
 
 from .pdc_dashboard import (
     dashboard_widget, dashboard_panel, dashboard_list, WidgetData,
@@ -37,8 +39,11 @@ except Exception:
 
 DEFAULT_GUILD = {
     "language": "en-US",  # per-guild language of this cog (de-DE | en-US)
+    "cooldown": 60,  # per member+channel DM cooldown in seconds (spam guard)
     "notifications": {
-        # "<channel_id>": {"enabled": true, "text": "..."}
+        # "<channel_id>": {"enabled": true, "text": "...",
+        #                  "leave_enabled": false, "leave_text": "..."}
+        # (leave_* keys are optional — read with .get() for backward compat)
     },
 }
 
@@ -52,7 +57,8 @@ def _render_template(text: str, *, member: discord.Member, channel: discord.abc.
 
 
 def _is_voiceish(channel: discord.abc.GuildChannel) -> bool:
-    return isinstance(channel, discord.VoiceChannel)
+    # Voice and stage channels are both supported.
+    return isinstance(channel, (discord.VoiceChannel, discord.StageChannel))
 
 
 class _JoinNotificationTextModal(discord.ui.Modal, title="Join Notification Text"):
@@ -90,7 +96,7 @@ class JoinNotificationSetupView(discord.ui.View):
 
         self.channel_select = discord.ui.ChannelSelect(
             placeholder=tr_lang(lang, "Channel auswählen…", "Select a channel…"),
-            channel_types=[discord.ChannelType.voice],
+            channel_types=[discord.ChannelType.voice, discord.ChannelType.stage_voice],
             min_values=1,
             max_values=1,
         )
@@ -251,6 +257,8 @@ class ChannelJoinNotification(commands.Cog):
         self.config.register_guild(**DEFAULT_GUILD)
         self._dashboard_attached = False
         self._selected_channel = {}  # (guild_id, user_id) -> channel_id
+        # (guild_id, channel_id, member_id) -> last DM timestamp (cooldown guard)
+        self._last_dm: Dict[Tuple[int, int, int], float] = {}
 
     # --------------------
     # Slash UI
@@ -264,8 +272,9 @@ class ChannelJoinNotification(commands.Cog):
         }},
     )
     @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
     async def join_notification(self, interaction: discord.Interaction) -> None:
-        """Configure the DM sent when members join a voice channel."""
+        """Configure the DM sent when members join a voice/stage channel (admin only)."""
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             lang = await self.config.guild(interaction.guild).language() if interaction.guild else "en-US"
             await interaction.response.send_message(
@@ -273,12 +282,183 @@ class ChannelJoinNotification(commands.Cog):
             )
             return
         lang = await self.config.guild(interaction.guild).language()
+        # Runtime permission check: this is a configuration command (admin tier).
+        member = interaction.user
+        is_owner = await self.bot.is_owner(member)
+        if not (is_owner or await self.bot.is_admin(member) or member.guild_permissions.manage_guild):
+            await interaction.response.send_message(
+                tr_lang(
+                    lang,
+                    "Dafür brauchst du **Server verwalten** (Admin).",
+                    "You need **Manage Server** (admin) to use this.",
+                ),
+                ephemeral=True,
+            )
+            return
         view = JoinNotificationSetupView(self, interaction.guild, interaction.user.id, lang=lang)
         await interaction.response.send_message(await view._render(channel=None), ephemeral=True, view=view)
 
     # --------------------
+    # Admin configuration commands
+    # --------------------
+    @commands.hybrid_group(name="cjnset")
+    @commands.guild_only()
+    @commands.admin_or_permissions(manage_guild=True)
+    async def cjnset(self, ctx: commands.Context) -> None:
+        """Configure channel join/leave notifications."""
+
+    @cjnset.command(name="cooldown")
+    @app_commands.describe(seconds="Per member+channel DM cooldown in seconds (0-3600)")
+    async def cjn_cooldown(self, ctx: commands.Context, seconds: int) -> None:
+        """Set the per-member+channel DM cooldown (spam guard)."""
+        lang = await self.config.guild(ctx.guild).language()
+        seconds = max(0, min(3600, seconds))
+        await self.config.guild(ctx.guild).cooldown.set(seconds)
+        await ctx.send(tr_lang(lang, f"Cooldown: {seconds} Sekunden.", f"Cooldown: {seconds} seconds."))
+
+    @cjnset.command(name="leave")
+    @app_commands.describe(
+        channel="Voice/stage channel",
+        on_off="Enable or disable the leave DM",
+        text="Optional leave DM text (placeholders: <Username>, <Channelname>)",
+    )
+    async def cjn_leave(
+        self,
+        ctx: commands.Context,
+        channel: discord.abc.GuildChannel,
+        on_off: bool,
+        *,
+        text: Optional[str] = None,
+    ) -> None:
+        """Enable/disable an optional DM when members leave a channel."""
+        lang = await self.config.guild(ctx.guild).language()
+        if not _is_voiceish(channel):
+            await ctx.send(tr_lang(
+                lang,
+                "Bitte einen Sprach- oder Bühnenkanal angeben.",
+                "Please provide a voice or stage channel.",
+            ))
+            return
+        async with self.config.guild(ctx.guild).notifications() as data:
+            entry = data.get(str(channel.id)) if isinstance(data.get(str(channel.id)), dict) else {}
+            entry["leave_enabled"] = bool(on_off)
+            if text is not None:
+                entry["leave_text"] = str(text).strip()[:1500]
+            data[str(channel.id)] = entry
+        state = tr_lang(lang, "aktiviert" if on_off else "deaktiviert", "enabled" if on_off else "disabled")
+        await ctx.send(tr_lang(
+            lang,
+            f"Leave-DM für **{channel.name}** {state}.",
+            f"Leave DM for **{channel.name}** {state}.",
+        ))
+
+    @cjnset.command(name="list")
+    async def cjn_list_cmd(self, ctx: commands.Context) -> None:
+        """List all configured channel notifications (paginated)."""
+        lang = await self.config.guild(ctx.guild).language()
+        data = await self.config.guild(ctx.guild).notifications()
+        cooldown = int(await self.config.guild(ctx.guild).cooldown() or 0)
+        lines: List[str] = []
+        for cid, entry in (data or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            ch = ctx.guild.get_channel(int(cid)) if str(cid).isdigit() else None
+            name = f"🔊 {ch.name}" if ch else str(cid)
+            join_state = "✅" if entry.get("enabled") else "—"
+            leave_state = "✅" if entry.get("leave_enabled") else "—"
+            txt = str(entry.get("text", "") or "")
+            preview = (txt[:40] + "…") if len(txt) > 40 else (txt or "—")
+            lines.append(f"**{name}** · Join: {join_state} · Leave: {leave_state} · Text: `{preview}`")
+        if not lines:
+            await ctx.send(tr_lang(lang, "Keine Benachrichtigungen konfiguriert.", "No notifications configured."))
+            return
+        per_page = 10
+        chunks = [lines[i:i + per_page] for i in range(0, len(lines), per_page)]
+        colour = await ctx.embed_colour()
+        pages: List[discord.Embed] = []
+        for idx, chunk in enumerate(chunks, start=1):
+            embed = discord.Embed(
+                title=tr_lang(lang, "Join-Benachrichtigungen", "Join notifications"),
+                description="\n".join(chunk)[:4000],
+                colour=colour,
+            )
+            embed.add_field(
+                name="Cooldown",
+                value=tr_lang(lang, f"{cooldown} Sekunden", f"{cooldown} seconds"),
+                inline=False,
+            )
+            if len(chunks) > 1:
+                embed.set_footer(text=tr_lang(lang, f"Seite {idx}/{len(chunks)}", f"Page {idx}/{len(chunks)}"))
+            pages.append(embed)
+        if len(pages) == 1:
+            await ctx.send(embed=pages[0])
+        else:
+            await menu(ctx, pages, DEFAULT_CONTROLS, timeout=120)
+
+    @cjnset.command(name="language")
+    @app_commands.describe(language="Output language: de-DE or en-US")
+    async def cjn_language(self, ctx: commands.Context, language: str) -> None:
+        """Set the output language for this server."""
+        language = "de-DE" if language.lower().startswith("de") else "en-US"
+        await self.config.guild(ctx.guild).language.set(language)
+        await ctx.send(tr_lang(language, "Sprache: Deutsch", "Language: English"))
+
+    # --------------------
     # Listener
     # --------------------
+    def _cooldown_ok(self, guild_id: int, channel_id: int, member_id: int, cooldown: int) -> bool:
+        """True if a DM may be sent (per member+channel cooldown not active)."""
+        key = (guild_id, channel_id, member_id)
+        now = time.time()
+        if now - self._last_dm.get(key, 0.0) < max(0, cooldown):
+            return False
+        self._last_dm[key] = now
+        # Opportunistic pruning so the map does not grow forever.
+        if len(self._last_dm) > 5000:
+            cutoff = now - 3600
+            self._last_dm = {k: v for k, v in self._last_dm.items() if v > cutoff}
+        return True
+
+    async def _send_channel_dm(
+        self,
+        member: discord.Member,
+        channel: discord.abc.GuildChannel,
+        entry: dict,
+        *,
+        event: str,
+    ) -> None:
+        """Send the configured join/leave DM for a channel (with all guards)."""
+        if event == "join":
+            if not entry.get("enabled", False):
+                return
+            text = str(entry.get("text", "") or "").strip()
+        else:
+            if not entry.get("leave_enabled", False):
+                return
+            text = str(entry.get("leave_text", "") or "").strip()
+        if not text:
+            return
+        # Skip channels the member cannot even see (e.g. force-moved by a mod).
+        try:
+            if not channel.permissions_for(member).view_channel:
+                return
+        except Exception:
+            pass
+        cooldown = int(await self.config.guild(member.guild).cooldown() or 0)
+        if not self._cooldown_ok(member.guild.id, channel.id, member.id, cooldown):
+            return
+        dm_text = _render_template(text, member=member, channel=channel)
+        # Always include a readable channel name, not just an ID/mention.
+        channel_name = getattr(channel, "name", str(channel.id))
+        if "<Channelname>" not in text:
+            dm_text = f"{dm_text}\n(#{channel_name})"
+        try:
+            dm = await member.create_dm()
+            await dm.send(dm_text)
+        except Exception:
+            # DM might be disabled; ignore silently.
+            return
+
     @commands.Cog.listener()
     async def on_voice_state_update(
         self,
@@ -290,28 +470,22 @@ class ChannelJoinNotification(commands.Cog):
             return
         if before.channel == after.channel:
             return
-        if after.channel is None:
-            return
-        if not _is_voiceish(after.channel):
-            return
 
         data = await self.config.guild(member.guild).notifications()
         if not isinstance(data, dict):
             return
-        entry = data.get(str(after.channel.id), {})
-        if not isinstance(entry, dict) or not entry.get("enabled", False):
-            return
-        text = str(entry.get("text", "") or "").strip()
-        if not text:
-            return
 
-        dm_text = _render_template(text, member=member, channel=after.channel)
-        try:
-            dm = await member.create_dm()
-            await dm.send(dm_text)
-        except Exception:
-            # DM might be disabled; ignore silently.
-            return
+        # Leave notification (optional, per channel).
+        if before.channel is not None and _is_voiceish(before.channel):
+            entry = data.get(str(before.channel.id), {})
+            if isinstance(entry, dict):
+                await self._send_channel_dm(member, before.channel, entry, event="leave")
+
+        # Join notification.
+        if after.channel is not None and _is_voiceish(after.channel):
+            entry = data.get(str(after.channel.id), {})
+            if isinstance(entry, dict):
+                await self._send_channel_dm(member, after.channel, entry, event="join")
 
     # --------------------
     # Dashboard attach helpers (AAA3A dashboard)
@@ -335,16 +509,6 @@ class ChannelJoinNotification(commands.Cog):
         if dashboard_cog is not None:
             self._dashboard_attached = self._attach_to_dashboard(dashboard_cog)
         register_dashboard(self)
-
-    async def cog_unload(self) -> None:
-        unregister_dashboard(self)
-        dashboard_cog = self._get_dashboard_cog()
-        if dashboard_cog is not None:
-            try:
-                dashboard_cog.rpc.third_parties_handler.remove_third_party(self)
-            except Exception:
-                pass
-        self._dashboard_attached = False
 
     @commands.Cog.listener()
     async def on_cog_add(self, cog: commands.Cog) -> None:
@@ -376,13 +540,14 @@ class ChannelJoinNotification(commands.Cog):
         guild_id = ctx.guild.id
         user_id = ctx.user.id
 
-        # Get voice channels
-        voice = [c for c in ctx.guild.channels if isinstance(c, discord.VoiceChannel)]
+        # Voice and stage channels are both supported.
+        voice = [c for c in ctx.guild.channels if _is_voiceish(c)]
         voice = sorted(voice, key=lambda c: (c.position or 0, c.name.lower()))
 
         voice_choices = [{"value": "0", "label": "-- Select voice channel --"}]
         for c in voice:
-            voice_choices.append({"value": str(c.id), "label": f"🔊 {c.name} ({c.id})"})
+            icon = "🎙️" if isinstance(c, discord.StageChannel) else "🔊"
+            voice_choices.append({"value": str(c.id), "label": f"{icon} {c.name} ({c.id})"})
 
         selection = self._selected_channel.get((guild_id, user_id), "0")
 
@@ -410,6 +575,8 @@ class ChannelJoinNotification(commands.Cog):
             fields.extend([
                 Field.switch("enabled", "Enabled", value=bool(entry.get("enabled", False))),
                 Field.textarea("text", "DM text", value=str(entry.get("text", "")), max_length=1500, variables=variables),
+                Field.switch("leave_enabled", L("Leave-DM aktiv", "Leave DM enabled"), value=bool(entry.get("leave_enabled", False))),
+                Field.textarea("leave_text", L("Leave-DM-Text", "Leave DM text"), value=str(entry.get("leave_text", "")), max_length=1500, variables=variables),
                 Field.switch("delete_entry", "Delete/reset entry completely", value=False)
             ])
 
@@ -443,11 +610,20 @@ class ChannelJoinNotification(commands.Cog):
             self._selected_channel[(guild_id, user_id)] = "0"
             return SubmitResult.ok(tr(ctx, "Eintrag gelöscht.", "Entry deleted."))
 
-        # Normal save
-        notifications[channel_id] = {
+        # Input validation: the channel must exist and be a voice/stage channel.
+        channel = ctx.guild.get_channel(int(channel_id)) if channel_id.isdigit() else None
+        if channel is None or not _is_voiceish(channel):
+            return SubmitResult.fail(tr(ctx, "Ungültiger Kanal.", "Invalid channel."))
+
+        # Normal save (keep unknown keys of existing entries intact).
+        entry = notifications.get(channel_id) if isinstance(notifications.get(channel_id), dict) else {}
+        entry.update({
             "enabled": bool(data.get("enabled", False)),
-            "text": str(data.get("text", "")).strip()[:1500]
-        }
+            "text": str(data.get("text", "")).strip()[:1500],
+            "leave_enabled": bool(data.get("leave_enabled", False)),
+            "leave_text": str(data.get("leave_text", "")).strip()[:1500],
+        })
+        notifications[channel_id] = entry
         await self.config.guild(ctx.guild).notifications.set(notifications)
         return SubmitResult.ok(tr(ctx, "Eintrag gespeichert.", "Entry saved."))
 
@@ -474,7 +650,8 @@ class ChannelJoinNotification(commands.Cog):
         permission="guild_admin",
         columns=[
             {"key": "channel", "label": "Voice channel"},
-            {"key": "enabled", "label": "Active"},
+            {"key": "enabled", "label": "Join"},
+            {"key": "leave", "label": "Leave"},
             {"key": "text", "label": "DM text"},
         ],
     )
@@ -485,7 +662,7 @@ class ChannelJoinNotification(commands.Cog):
             if not isinstance(e, dict):
                 continue
             # Only show entries that are actually configured.
-            if not (e.get("enabled") or e.get("text")):
+            if not (e.get("enabled") or e.get("text") or e.get("leave_enabled")):
                 continue
             ch = ctx.guild.get_channel(int(cid)) if str(cid).isdigit() else None
             txt = str(e.get("text", "") or "")
@@ -494,6 +671,7 @@ class ChannelJoinNotification(commands.Cog):
                 "cells": {
                     "channel": ("🔊 " + ch.name) if ch else str(cid),
                     "enabled": "✅" if e.get("enabled") else "—",
+                    "leave": "✅" if e.get("leave_enabled") else "—",
                     "text": (txt[:60] + "…") if len(txt) > 60 else (txt or "—"),
                 },
             })
@@ -513,6 +691,9 @@ class ChannelJoinNotification(commands.Cog):
                 Field.switch("enabled", "Active", value=bool(entry.get("enabled"))),
                 Field.textarea("text", "DM text", value=str(entry.get("text", "")),
                                max_length=1500, variables=variables),
+                Field.switch("leave_enabled", L("Leave-DM aktiv", "Leave DM enabled"), value=bool(entry.get("leave_enabled"))),
+                Field.textarea("leave_text", L("Leave-DM-Text", "Leave DM text"), value=str(entry.get("leave_text", "")),
+                               max_length=1500, variables=variables),
             ],
         )
 
@@ -524,6 +705,10 @@ class ChannelJoinNotification(commands.Cog):
                 entry["enabled"] = bool(data["enabled"])
             if "text" in data:
                 entry["text"] = str(data["text"])[:1500]
+            if "leave_enabled" in data:
+                entry["leave_enabled"] = bool(data["leave_enabled"])
+            if "leave_text" in data:
+                entry["leave_text"] = str(data["leave_text"])[:1500]
             notifications[str(item_id)] = entry
         return SubmitResult.ok(tr(ctx, "Gespeichert.", "Saved."))
 

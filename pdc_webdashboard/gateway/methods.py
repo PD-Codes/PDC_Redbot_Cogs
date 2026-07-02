@@ -119,6 +119,79 @@ async def _require(gateway: Any, ctx: DashboardContext, permission: str) -> None
 
 
 # --------------------------------------------------------------------------- #
+# Central input validation for write payloads coming from the web app
+# --------------------------------------------------------------------------- #
+# Applied in the gateway BEFORE data reaches any integrated cog's on_submit /
+# on_edit handler, so every third-party panel benefits without doing its own
+# sanitisation. Limits are deliberately generous (Discord messages cap at
+# 2000/4096 chars) but hard enough to stop abuse via oversized payloads.
+_SANITIZE_MAX_STR = 8000       # max characters per string value
+_SANITIZE_MAX_KEY = 200        # max characters per dict key
+_SANITIZE_MAX_ITEMS = 500      # max entries per list
+_SANITIZE_MAX_KEYS = 100       # max keys per dict
+_SANITIZE_MAX_DEPTH = 6        # max nesting depth
+_SANITIZE_MAX_NUM = 1e15       # max magnitude for numbers
+
+# C0/C1 control characters except \n (0x0A) and \t (0x09); also DEL (0x7F).
+_CTRL_TABLE = {c: None for c in list(range(0x00, 0x20)) + list(range(0x7F, 0xA0))}
+del _CTRL_TABLE[0x0A]
+del _CTRL_TABLE[0x09]
+
+
+def _sanitize_str(value: str, max_len: int = _SANITIZE_MAX_STR) -> str:
+    """Strip control characters (keep newline/tab) and cap the length."""
+    cleaned = value.translate(_CTRL_TABLE)
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len]
+    return cleaned
+
+
+def _sanitize_value(value: Any, depth: int = 0) -> Any:
+    """Recursively validate/sanitise a JSON value from a panel submit.
+
+    - Strings: control characters stripped, length capped.
+    - Numbers: bool/int/float allowed; NaN/inf and absurd magnitudes rejected.
+    - Lists/dicts: size, key length and nesting depth capped.
+    - Any other type is rejected with INVALID_PARAMS.
+    """
+    if depth > _SANITIZE_MAX_DEPTH:
+        raise RpcError(INVALID_PARAMS, "Payload nesting too deep")
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return _sanitize_str(value)
+    if isinstance(value, int):
+        if abs(value) > _SANITIZE_MAX_NUM:
+            raise RpcError(INVALID_PARAMS, "Numeric value out of range")
+        return value
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")) or abs(value) > _SANITIZE_MAX_NUM:
+            raise RpcError(INVALID_PARAMS, "Numeric value out of range")
+        return value
+    if isinstance(value, list):
+        if len(value) > _SANITIZE_MAX_ITEMS:
+            raise RpcError(INVALID_PARAMS, "List payload too large")
+        return [_sanitize_value(v, depth + 1) for v in value]
+    if isinstance(value, dict):
+        if len(value) > _SANITIZE_MAX_KEYS:
+            raise RpcError(INVALID_PARAMS, "Object payload too large")
+        out: Dict[str, Any] = {}
+        for k, v in value.items():
+            if not isinstance(k, str):
+                raise RpcError(INVALID_PARAMS, "Object keys must be strings")
+            out[_sanitize_str(k, _SANITIZE_MAX_KEY)] = _sanitize_value(v, depth + 1)
+        return out
+    raise RpcError(INVALID_PARAMS, f"Unsupported value type: {type(value).__name__}")
+
+
+def _sanitize_submit_data(data: Any) -> Dict[str, Any]:
+    """Validate a submit payload (must be an object) and sanitise it in depth."""
+    if not isinstance(data, dict):
+        raise RpcError(INVALID_PARAMS, "Submit payload must be an object")
+    return _sanitize_value(data)
+
+
+# --------------------------------------------------------------------------- #
 # Core
 # --------------------------------------------------------------------------- #
 @dispatcher.method("core.botinfo")
@@ -282,6 +355,13 @@ def _i18n_desc(value: Any, locale: Any) -> Optional[str]:
     lang = loc.split("-")[0].lower()
     for k, v in value.items():
         if str(k).split("-")[0].lower() == lang:
+            return v
+    # Default fallback is ALWAYS English (never the first dict entry, which
+    # would make German the implicit default for unknown locales).
+    if "en-US" in value:
+        return value["en-US"]
+    for k, v in value.items():
+        if str(k).split("-")[0].lower() == "en":
             return v
     return next(iter(value.values()), None)
 
@@ -615,6 +695,8 @@ async def panel_submit(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     await _require(gateway, ctx, contrib.meta.permission)
     if contrib.submit is None:
         raise RpcError(INVALID_PARAMS, "Panel ist schreibgeschützt (kein on_submit)")
+    # Central input validation: every integrated cog gets sanitised data.
+    data = _sanitize_submit_data(data)
     result = await contrib.submit(ctx, data)
     gateway.audit("panel.submit", ctx, {"key": key})
     return {"result": result.to_dict(getattr(ctx, "locale", None)) if hasattr(result, "to_dict") else result}
@@ -693,6 +775,8 @@ async def list_edit(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     await _require(gateway, ctx, contrib.meta.permission)
     if contrib.edit is None:
         raise RpcError(INVALID_PARAMS, "Liste ist nicht bearbeitbar (kein on_edit)")
+    # Central input validation: every integrated cog gets sanitised data.
+    data = _sanitize_submit_data(data)
     result = await contrib.edit(ctx, item_id, data)
     gateway.audit("list.edit", ctx, {"key": key, "id": item_id})
     return {"result": result.to_dict(getattr(ctx, "locale", None)) if hasattr(result, "to_dict") else result}
@@ -883,7 +967,7 @@ async def slash_list(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
         ContextMenu = app_commands.ContextMenu
     except Exception:
         app_commands = None  # type: ignore
-        ContextMenu = ()  # isinstance(..., ()) ist immer False
+        ContextMenu = ()  # isinstance(..., ()) is always False
 
     def _ctype(c) -> int:
         try:
@@ -1813,6 +1897,29 @@ async def audit_list(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     return {"entries": out, "count": len(logs)}
 
 
+@dispatcher.method("requests.list")
+async def requests_list(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Recent RPC request-log entries for auditing (bot owner only).
+
+    Only populated while request logging is enabled (``[p]pdcdashboard reqlog``).
+    Newest entries first.
+    """
+    ctx = await _build_context(gateway, params)
+    await _require(gateway, ctx, "bot_owner")
+    args = params.get("args") or {}
+    try:
+        limit = int(args.get("limit", 200) or 200)
+    except Exception:
+        limit = 200
+    limit = max(1, min(limit, 500))
+    entries = list(getattr(gateway, "request_log", []) or [])
+    return {
+        "enabled": bool(getattr(gateway, "request_log_enabled", False)),
+        "entries": list(reversed(entries[-limit:])),
+        "count": len(entries),
+    }
+
+
 # ----- Custom Pages -------------------------------------------------------- #
 @dispatcher.method("pages.list")
 async def pages_list(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -2100,6 +2207,31 @@ async def serverstats_leaderboard(gateway: Any, params: Dict[str, Any]) -> Dict[
 @dispatcher.method("serverstats.retention")
 async def serverstats_retention(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     return await _stats_guild_only(gateway, params, "stats_retention")
+
+
+@dispatcher.method("serverstats.export")
+async def serverstats_export(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Export the collected statistics of a guild as JSON or CSV (guild admin).
+
+    args: {"format": "json" | "csv", "days": int}
+    Returns {"filename", "mimetype", "content"} — the web app offers it as a
+    file download.
+    """
+    ctx = await _build_context(gateway, params)
+    if ctx.guild is None:
+        raise RpcError(INVALID_PARAMS, "Unbekannte Guild")
+    await _require(gateway, ctx, "guild_admin")
+    cog = _serverstats(gateway)
+    if cog is None:
+        raise RpcError(INVALID_PARAMS, "WebDashboardStats-Cog ist nicht geladen")
+    if not hasattr(cog, "stats_export"):
+        raise RpcError(INVALID_PARAMS, "Export is not supported by the loaded stats cog")
+    args = params.get("args") or {}
+    fmt = str(args.get("format", "json")).lower()
+    days = int(args.get("days", 30) or 30)
+    result = await cog.stats_export(ctx.guild, days=days, fmt=fmt)
+    gateway.audit("serverstats.export", ctx, {"format": fmt, "days": days})
+    return result
 
 
 def _maybe_integration_base():

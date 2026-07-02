@@ -37,7 +37,7 @@ class EventMessages(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
-        self.config = Config.get_conf(self, identifier=981273598123)
+        self.config = Config.get_conf(self, identifier=981273598123, force_registration=True)
 
         default_templates = {
             "join": "🎉 **{display_name}** ist dem Server beigetreten!",

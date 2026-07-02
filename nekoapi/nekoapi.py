@@ -1,7 +1,22 @@
-import discord
+"""NekoAPI — anime images by content rating from api.nekosapi.com.
+
+Ratings other than ``safe`` are only allowed in NSFW channels. Invalid ratings
+are rejected explicitly (no silent fallback). Robust external API handling:
+timeout, retry with exponential backoff, TTL cache as fallback and a small
+per-channel LRU to avoid repeating images. Bilingual (DE/EN, default en-US).
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from collections import deque
+from typing import Deque, Dict, Optional, Tuple
+
 import aiohttp
+import discord
 from discord import app_commands
-from redbot.core import commands, Config
+from redbot.core import Config, commands
 
 from .pdc_dashboard import (
     register_dashboard, unregister_dashboard,
@@ -9,10 +24,17 @@ from .pdc_dashboard import (
     L, tr, tr_lang,
 )
 
+log = logging.getLogger("red.pdc.nekoapi")
 
 BASE_URL = "https://api.nekosapi.com/v4/images/random?limit=1&rating="
 
 VALID_RATINGS = ["safe", "suggestive", "borderline", "explicit"]
+NSFW_RATINGS = {"suggestive", "borderline", "explicit"}
+
+CACHE_TTL = 300  # seconds a cached response stays valid as fallback
+RECENT_PER_CHANNEL = 15
+HTTP_RETRIES = 3
+HTTP_TIMEOUT = 10  # seconds
 
 
 class NekoAPI(commands.Cog):
@@ -22,18 +44,37 @@ class NekoAPI(commands.Cog):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=0xD0DE20253, force_registration=True)
         self.config.register_guild(language="en-US")
+        self._session: Optional[aiohttp.ClientSession] = None
+        # rating -> (timestamp, item) — last good result as fallback
+        self._cache: Dict[str, Tuple[float, dict]] = {}
+        # channel_id -> recently shown image URLs
+        self._recent: Dict[int, Deque[str]] = {}
 
     async def cog_load(self) -> None:
         register_dashboard(self)
 
-    def cog_unload(self) -> None:
+    async def cog_unload(self) -> None:
         unregister_dashboard(self)
+        if self._session and not self._session.closed:
+            await self._session.close()
 
     async def _lang(self, ctx) -> str:
         guild = getattr(ctx, "guild", None)
         if guild is None:
             return "en-US"
         return await self.config.guild(guild).language()
+
+    @staticmethod
+    def _channel_is_nsfw(channel) -> bool:
+        """True if suggestive/borderline/explicit content may be posted here."""
+        checker = getattr(channel, "is_nsfw", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                return False
+        # DMs without an is_nsfw() implementation: treat as not NSFW-safe.
+        return False
 
     # ------------------------------------------------------------------
     # Dashboard: per-guild output language
@@ -64,36 +105,123 @@ class NekoAPI(commands.Cog):
 
     @settings_panel.on_submit
     async def _save_settings(self, ctx, data):
-        lang = str(data.get("language", "en-US")).strip() or "en-US"
+        lang = str(data.get("language", "en-US")).strip()
+        if lang not in ("de-DE", "en-US"):
+            lang = "en-US"
         await self.config.guild(ctx.guild).language.set(lang)
         return SubmitResult.ok(tr(ctx, "Gespeichert.", "Saved."))
 
     # ------------------------------------------------------------------
-    # Helper: API Request + Embed Builder
+    # Admin: per-guild output language via command
     # ------------------------------------------------------------------
-    async def fetch_image(self, rating: str):
-        async with aiohttp.ClientSession() as session:
-            async with session.get(BASE_URL + rating) as resp:
-                if resp.status != 200:
-                    return None
+    @commands.hybrid_command(name="nekoapiset-language")
+    @commands.guild_only()
+    @commands.admin_or_permissions(manage_guild=True)
+    @app_commands.describe(language="Output language: de-DE or en-US")
+    async def nekoapiset_language(self, ctx: commands.Context, language: str) -> None:
+        """Set the output language of the NekoAPI cog for this server."""
+        language = "de-DE" if language.lower().startswith("de") else "en-US"
+        await self.config.guild(ctx.guild).language.set(language)
+        await ctx.send(tr_lang(language, "Sprache: Deutsch", "Language: English"))
 
-                data = await resp.json()
-                if not data:
-                    return None
+    # ------------------------------------------------------------------
+    # HTTP helpers (timeout, retry + backoff, cache fallback)
+    # ------------------------------------------------------------------
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+            )
+        return self._session
 
-                return data[0]  # Object contains id, url, rating
+    async def _get_json(self, url: str):
+        """GET a JSON document with retries and exponential backoff on 429/5xx."""
+        session = await self._get_session()
+        delay = 1.0
+        for attempt in range(1, HTTP_RETRIES + 1):
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    if resp.status == 429 or resp.status >= 500:
+                        log.warning("nekosapi returned %s (attempt %s/%s)", resp.status, attempt, HTTP_RETRIES)
+                    else:
+                        log.warning("nekosapi returned %s for %s", resp.status, url)
+                        return None
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("nekosapi request failed (attempt %s/%s)", attempt, HTTP_RETRIES)
+            if attempt < HTTP_RETRIES:
+                await asyncio.sleep(delay)
+                delay *= 2
+        return None
 
-    async def build_embed(self, info: dict):
+    async def fetch_image(self, rating: str, channel_id: Optional[int] = None) -> Optional[dict]:
+        """Fetch one image object for a rating, avoiding recently shown URLs."""
+        recent = self._recent.setdefault(channel_id or 0, deque(maxlen=RECENT_PER_CHANNEL))
+        item = None
+        for _ in range(4):  # a few tries to find an unseen image
+            data = await self._get_json(BASE_URL + rating)
+            if isinstance(data, dict):
+                # Some API versions wrap the result: {"items": [...]}
+                data = data.get("items") or data.get("results") or []
+            if data:
+                candidate = data[0]
+                self._cache[rating] = (time.time(), candidate)
+                item = candidate
+                if candidate.get("url") not in recent:
+                    break
+            else:
+                break
+        if item is None:
+            cached = self._cache.get(rating)
+            if cached and time.time() - cached[0] <= CACHE_TTL:
+                item = cached[1]
+                log.info("Serving cached nekosapi result for rating %r", rating)
+        if item is not None and item.get("url"):
+            recent.append(item["url"])
+        return item
+
+    @staticmethod
+    def _error_embed(lang: str) -> discord.Embed:
+        return discord.Embed(
+            title=tr_lang(lang, "Fehler", "Error"),
+            description=tr_lang(
+                lang,
+                "Die NekoAPI ist gerade nicht erreichbar. Bitte versuche es später erneut.",
+                "The NekoAPI is currently unreachable. Please try again later.",
+            ),
+            color=0xFF0000,
+        )
+
+    async def build_embed(self, info: dict) -> discord.Embed:
         embed = discord.Embed(
-            title=f"NekoAPI – {info['rating']}",
-            color=0xFF66CC
+            title=f"NekoAPI – {info.get('rating', '?')}",
+            color=0xFF66CC,
         )
         embed.set_image(url=info["url"])
-        embed.set_footer(text=f"ID: {info['id']} | Rating: {info['rating']}")
+        embed.set_footer(text=f"ID: {info.get('id', '?')} | Rating: {info.get('rating', '?')}")
         return embed
 
+    def _rating_gate(self, lang: str, rating: str, channel) -> Optional[str]:
+        """Validate rating + channel. Returns an error message or None if OK."""
+        if rating not in VALID_RATINGS:
+            return tr_lang(
+                lang,
+                f"❌ Ungültiges Rating!\nErlaubt: {', '.join(VALID_RATINGS)}",
+                f"❌ Invalid rating!\nAllowed: {', '.join(VALID_RATINGS)}",
+            )
+        if rating in NSFW_RATINGS and not self._channel_is_nsfw(channel):
+            return tr_lang(
+                lang,
+                f"❌ `{rating}` ist nur in NSFW-Kanälen erlaubt.",
+                f"❌ `{rating}` is only allowed in NSFW channels.",
+            )
+        return None
+
     # ------------------------------------------------------------------
-    # Prefix Command
+    # Prefix command
     # ------------------------------------------------------------------
     @commands.command(
         name="nekoapi",
@@ -104,40 +232,22 @@ class NekoAPI(commands.Cog):
     )
     async def nekoapi_prefix(self, ctx, rating: str = "safe"):
         """Show an image by rating (default = safe)."""
-
         lang = await self._lang(ctx)
         rating = rating.lower()
 
-        if rating not in VALID_RATINGS:
-            return await ctx.send(
-                tr_lang(
-                    lang,
-                    f"❌ Ungültiges Rating!\nErlaubt: {', '.join(VALID_RATINGS)}",
-                    f"❌ Invalid rating!\nAllowed: {', '.join(VALID_RATINGS)}",
-                )
-            )
+        error = self._rating_gate(lang, rating, ctx.channel)
+        if error:
+            return await ctx.send(error)
 
-        # NSFW check for explicit
-        if rating == "explicit" and not ctx.channel.is_nsfw():
-            return await ctx.send(
-                tr_lang(
-                    lang,
-                    "❌ `explicit` ist nur in NSFW-Channels erlaubt.",
-                    "❌ `explicit` is only allowed in NSFW channels.",
-                )
-            )
-
-        info = await self.fetch_image(rating)
-        if not info:
-            return await ctx.send(
-                tr_lang(lang, "❌ Fehler beim Abrufen der API.", "❌ Error fetching from the API.")
-            )
+        info = await self.fetch_image(rating, channel_id=ctx.channel.id)
+        if not info or not info.get("url"):
+            return await ctx.send(embed=self._error_embed(lang))
 
         embed = await self.build_embed(info)
         await ctx.send(embed=embed)
 
     # ------------------------------------------------------------------
-    # Slash: /nekoapi (fix safe)
+    # Slash: /nekoapi (fixed rating "safe")
     # ------------------------------------------------------------------
     @app_commands.command(
         name="nekoapi",
@@ -152,11 +262,9 @@ class NekoAPI(commands.Cog):
         await interaction.response.defer()
         lang = await self._lang(interaction)
 
-        info = await self.fetch_image("safe")
-        if not info:
-            return await interaction.followup.send(
-                tr_lang(lang, "❌ Fehler beim Abrufen der API.", "❌ Error fetching from the API.")
-            )
+        info = await self.fetch_image("safe", channel_id=interaction.channel_id)
+        if not info or not info.get("url"):
+            return await interaction.followup.send(embed=self._error_embed(lang))
 
         embed = await self.build_embed(info)
         await interaction.followup.send(embed=embed)
@@ -192,30 +300,13 @@ class NekoAPI(commands.Cog):
         await interaction.response.defer()
         lang = await self._lang(interaction)
 
-        if rating not in VALID_RATINGS:
-            return await interaction.followup.send(
-                tr_lang(
-                    lang,
-                    f"❌ Ungültiges Rating! Erlaubt: {', '.join(VALID_RATINGS)}",
-                    f"❌ Invalid rating! Allowed: {', '.join(VALID_RATINGS)}",
-                )
-            )
+        error = self._rating_gate(lang, rating, interaction.channel)
+        if error:
+            return await interaction.followup.send(error)
 
-        # NSFW check for explicit
-        if rating == "explicit" and not interaction.channel.is_nsfw():
-            return await interaction.followup.send(
-                tr_lang(
-                    lang,
-                    "❌ `explicit` ist nur in NSFW-Channels erlaubt.",
-                    "❌ `explicit` is only allowed in NSFW channels.",
-                )
-            )
-
-        info = await self.fetch_image(rating)
-        if not info:
-            return await interaction.followup.send(
-                tr_lang(lang, "❌ Fehler beim Abrufen der API.", "❌ Error fetching from the API.")
-            )
+        info = await self.fetch_image(rating, channel_id=interaction.channel_id)
+        if not info or not info.get("url"):
+            return await interaction.followup.send(embed=self._error_embed(lang))
 
         embed = await self.build_embed(info)
         await interaction.followup.send(embed=embed)

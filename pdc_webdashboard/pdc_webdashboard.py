@@ -45,6 +45,11 @@ class WebDashboard(commands.Cog, name="pdc_webdashboard"):
             host=DEFAULT_HOST,
             port=DEFAULT_PORT,
             autostart=True,
+            # Security / gateway hardening
+            cors_origins=[],      # allowed browser origins (empty = no CORS headers)
+            request_log=False,    # optional RPC request logging for auditing
+            token_rotate_h=0,     # automatic token rotation interval in hours (0 = off)
+            token_rotated_at=0,   # unix timestamp of the last token (re)generation
             # Branding / UI
             ui={
                 "title": "PDC Dashboard",
@@ -102,16 +107,20 @@ class WebDashboard(commands.Cog, name="pdc_webdashboard"):
         if not token:
             token = secrets.token_urlsafe(48)
             await self.config.token.set(token)
+            await self.config.token_rotated_at.set(int(time.time()))
         host = await self.config.host()
         port = await self.config.port()
+        cors_origins = await self.config.cors_origins()
+        request_log = await self.config.request_log()
         self.gateway = Gateway(
             self.bot, self.registry, token=token, host=host, port=port,
             audit_sink=self._persist_audit,
+            cors_origins=cors_origins, request_log=request_log,
         )
         try:
             await self.gateway.start()
         except Exception:
-            log.exception("Gateway konnte nicht gestartet werden")
+            log.exception("Gateway could not be started")
             self.gateway = None
             raise
 
@@ -141,9 +150,39 @@ class WebDashboard(commands.Cog, name="pdc_webdashboard"):
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.debug("Monitor-Durchlauf fehlgeschlagen", exc_info=True)
+                log.debug("Monitor run failed", exc_info=True)
+            try:
+                # Automatic gateway-token rotation (optional, owner-configured).
+                rot_h = int(await self.config.token_rotate_h() or 0)
+                if rot_h > 0:
+                    rotated_at = float(await self.config.token_rotated_at() or 0)
+                    if time.time() >= rotated_at + rot_h * 3600:
+                        await self._rotate_token(notify=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.debug("Automatic token rotation failed", exc_info=True)
             # Re-evaluate config/interval every 5 minutes (picks up changes quickly).
             await asyncio.sleep(300)
+
+    async def _rotate_token(self, notify: bool = False) -> str:
+        """Generate a new gateway token and apply it to the running gateway.
+
+        The gateway keeps running (no downtime); only new requests must carry
+        the new token. Optionally notifies the bot owners via DM.
+        """
+        token = secrets.token_urlsafe(48)
+        await self.config.token.set(token)
+        await self.config.token_rotated_at.set(int(time.time()))
+        if self.gateway is not None:
+            self.gateway.update_token(token)
+        log.info("Gateway token rotated")
+        if notify:
+            await self._dm_owners(
+                "🔑 **PDC Dashboard** — the gateway token was rotated automatically. "
+                "Update the web app: fetch the new token with `[p]pdcdashboard token`."
+            )
+        return token
 
     async def _run_monitor(self, cfg: dict) -> None:
         cogs: list = []
@@ -162,7 +201,7 @@ class WebDashboard(commands.Cog, name="pdc_webdashboard"):
                     installed = await _installed_cogs(dl)
                     cogs = sorted(await _cogs_with_updates(dl, installed))
         except Exception:
-            log.debug("Cog-Update-Check fehlgeschlagen", exc_info=True)
+            log.debug("Cog update check failed", exc_info=True)
         await self.config.monitor_last.set({"cogs": cogs, "checked_at": int(time.time())})
         if cfg.get("alerts_dm"):
             await self._maybe_alert(cogs, cfg)
@@ -184,7 +223,7 @@ class WebDashboard(commands.Cog, name="pdc_webdashboard"):
                 if user is not None:
                     await user.send(text)
             except Exception:
-                log.debug("Owner-DM fehlgeschlagen (%s)", oid, exc_info=True)
+                log.debug("Owner DM failed (%s)", oid, exc_info=True)
 
     async def _maybe_alert(self, cogs: list, cfg: dict) -> None:
         alerted = await self.config.monitor_alerted()
@@ -217,7 +256,7 @@ class WebDashboard(commands.Cog, name="pdc_webdashboard"):
                 logs.append(entry)
                 del logs[:-1000]  # keep only the last 1000 entries
         except Exception:
-            log.debug("Audit-Persistierung fehlgeschlagen", exc_info=True)
+            log.debug("Audit persistence failed", exc_info=True)
 
     def register_third_party(self, cog: Any) -> int:
         """Registers the dashboard contributions of a third-party cog."""
@@ -229,6 +268,20 @@ class WebDashboard(commands.Cog, name="pdc_webdashboard"):
     # ------------------------------------------------------------------ #
     # Commands (bot owner only)
     # ------------------------------------------------------------------ #
+    async def cog_check(self, ctx: commands.Context) -> bool:
+        """Defence in depth: EVERY text/hybrid command of this cog is bot-owner only.
+
+        Gateway token, bind address, CORS and logging are bot-level settings; no
+        guild admin, mod or regular user may ever touch them. Each command also
+        carries its own ``@commands.is_owner()`` check (parent-group checks are
+        not reliably applied to hybrid subcommands invoked as slash commands).
+        """
+        return await self.bot.is_owner(ctx.author)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Same owner gate for app-command (slash) invocations of this cog."""
+        return await self.bot.is_owner(interaction.user)
+
     @commands.is_owner()
     @commands.hybrid_group(
         name="pdcdashboard", aliases=["pdcdash"], description="Manage the PDC web dashboard.",
@@ -243,6 +296,7 @@ class WebDashboard(commands.Cog, name="pdc_webdashboard"):
         Note: Uses its own command name so it can run alongside AAA3A's `[p]dashboard`.
         """
 
+    @commands.is_owner()
     @dashboard_group.command(
         name="status", description="Show the current status of the gateway.",
         extras={"i18n_desc": {
@@ -255,15 +309,24 @@ class WebDashboard(commands.Cog, name="pdc_webdashboard"):
         running = self.gateway is not None
         host = await self.config.host()
         port = await self.config.port()
+        cors = await self.config.cors_origins()
+        reqlog = await self.config.request_log()
+        rotate_h = int(await self.config.token_rotate_h() or 0)
         contribs = len(self.registry.all())
         cogs = len({c.cog_name for c in self.registry.all()})
         lines = [
-            _("Status: {state}").format(state=_("läuft") if running else _("gestoppt")),
-            _("Adresse: http://{host}:{port}").format(host=host, port=port),
-            _("Registrierte Beiträge: {n} (aus {c} Cogs)").format(n=contribs, c=cogs),
+            _("Status: {state}").format(state=_("running") if running else _("stopped")),
+            _("Address: http://{host}:{port}").format(host=host, port=port),
+            _("Registered contributions: {n} (from {c} cogs)").format(n=contribs, c=cogs),
+            _("CORS origins: {origins}").format(origins=", ".join(cors) if cors else "—"),
+            _("Request logging: {state}").format(state=_("enabled") if reqlog else _("disabled")),
+            _("Token auto-rotation: {value}").format(
+                value=_("every {hours} h").format(hours=rotate_h) if rotate_h else _("disabled")
+            ),
         ]
         await ctx.send(box("\n".join(lines)))
 
+    @commands.is_owner()
     @dashboard_group.command(
         name="start", description="Start the gateway.",
         extras={"i18n_desc": {
@@ -276,10 +339,11 @@ class WebDashboard(commands.Cog, name="pdc_webdashboard"):
         try:
             await self._start_gateway()
         except Exception as e:
-            await ctx.send(_("Start fehlgeschlagen: {error}").format(error=e))
+            await ctx.send(_("Start failed: {error}").format(error=e))
             return
-        await ctx.send(_("Gateway gestartet."))
+        await ctx.send(_("Gateway started."))
 
+    @commands.is_owner()
     @dashboard_group.command(
         name="stop", description="Stop the gateway.",
         extras={"i18n_desc": {
@@ -290,8 +354,9 @@ class WebDashboard(commands.Cog, name="pdc_webdashboard"):
     async def dashboard_stop(self, ctx: commands.Context) -> None:
         """Stop the gateway."""
         await self._stop_gateway()
-        await ctx.send(_("Gateway gestoppt."))
+        await ctx.send(_("Gateway stopped."))
 
+    @commands.is_owner()
     @dashboard_group.command(
         name="bind", description="Set the gateway host and port (restart required).",
         extras={"i18n_desc": {
@@ -306,10 +371,113 @@ class WebDashboard(commands.Cog, name="pdc_webdashboard"):
         Note: For security reasons the gateway should listen only on 127.0.0.1
         and be exposed externally through a reverse proxy or tunnel.
         """
+        if not 1 <= port <= 65535:
+            await ctx.send(_("Value must be between {min} and {max}.").format(min=1, max=65535))
+            return
         await self.config.host.set(host)
         await self.config.port.set(port)
-        await ctx.send(_("Gespeichert: {host}:{port}. Bitte neu starten.").format(host=host, port=port))
+        await ctx.send(_("Saved: {host}:{port}. Restart the gateway to apply.").format(host=host, port=port))
 
+    @commands.is_owner()
+    @dashboard_group.command(
+        name="port", description="Set the gateway port (restart required).",
+        extras={"i18n_desc": {
+            "de-DE": "Setzt den Gateway-Port (Neustart erforderlich).",
+            "en-US": "Set the gateway port (restart required).",
+        }},
+    )
+    @app_commands.describe(port="Listen port (e.g. 6970)")
+    async def dashboard_port(self, ctx: commands.Context, port: int) -> None:
+        """Set the gateway port only (host stays unchanged; restart required)."""
+        if not 1 <= port <= 65535:
+            await ctx.send(_("Value must be between {min} and {max}.").format(min=1, max=65535))
+            return
+        host = await self.config.host()
+        await self.config.port.set(port)
+        await ctx.send(_("Saved: {host}:{port}. Restart the gateway to apply.").format(host=host, port=port))
+
+    @commands.is_owner()
+    @dashboard_group.command(
+        name="cors", description="Manage allowed CORS origins (list/add/remove/clear).",
+        extras={"i18n_desc": {
+            "de-DE": "Verwaltet erlaubte CORS-Origins (list/add/remove/clear).",
+            "en-US": "Manage allowed CORS origins (list/add/remove/clear).",
+        }},
+    )
+    @app_commands.describe(
+        action="list | add | remove | clear",
+        origin="Origin, e.g. https://dashboard.example.com",
+    )
+    async def dashboard_cors(
+        self, ctx: commands.Context, action: str = "list", origin: Optional[str] = None
+    ) -> None:
+        """Manage the allowed CORS origins of the gateway.
+
+        Origins are full scheme://host[:port] values (no path). An empty list
+        means the gateway sends no CORS headers at all (BFF-only usage).
+        """
+        action = (action or "list").lower()
+        if action == "list":
+            cors = await self.config.cors_origins()
+            if cors:
+                await ctx.send(_("CORS origins: {origins}").format(origins=", ".join(cors)))
+            else:
+                await ctx.send(_("No CORS origins configured."))
+            return
+        if action == "clear":
+            await self.config.cors_origins.set([])
+            if self.gateway is not None:
+                self.gateway.update_cors_origins([])
+            await ctx.send(_("CORS origins cleared."))
+            return
+        if action in ("add", "remove"):
+            origin = (origin or "").strip().rstrip("/")
+            if not origin or "://" not in origin or "/" in origin.split("://", 1)[1]:
+                await ctx.send(_("Invalid origin. Use e.g. `https://dashboard.example.com`."))
+                return
+            async with self.config.cors_origins() as cors:
+                if action == "add" and origin not in cors:
+                    cors.append(origin)
+                elif action == "remove" and origin in cors:
+                    cors.remove(origin)
+                current = list(cors)
+            if self.gateway is not None:
+                self.gateway.update_cors_origins(current)
+            if action == "add":
+                await ctx.send(_("Added CORS origin: {origin}").format(origin=origin))
+            else:
+                await ctx.send(_("Removed CORS origin: {origin}").format(origin=origin))
+            return
+        await ctx.send(_("Unknown action. Use: list, add, remove, clear."))
+
+    @commands.is_owner()
+    @dashboard_group.command(
+        name="reqlog", description="Enable/disable RPC request logging (auditing).",
+        extras={"i18n_desc": {
+            "de-DE": "Aktiviert/deaktiviert das RPC-Request-Logging (Auditing).",
+            "en-US": "Enable/disable RPC request logging (auditing).",
+        }},
+    )
+    @app_commands.describe(enabled="true = log dashboard RPC calls, false = off")
+    async def dashboard_reqlog(self, ctx: commands.Context, enabled: Optional[bool] = None) -> None:
+        """Show or toggle the optional request logging of dashboard RPC calls.
+
+        When enabled, every RPC call (method, user, guild, duration, outcome) is
+        written to the bot log and kept in an in-memory ring buffer that can be
+        queried via the ``requests.list`` RPC method (owner only).
+        """
+        if enabled is None:
+            state = await self.config.request_log()
+            await ctx.send(_("Request logging: {state}").format(
+                state=_("enabled") if state else _("disabled")))
+            return
+        await self.config.request_log.set(bool(enabled))
+        if self.gateway is not None:
+            self.gateway.set_request_logging(bool(enabled))
+        await ctx.send(_("Request logging: {state}").format(
+            state=_("enabled") if enabled else _("disabled")))
+
+    @commands.is_owner()
     @dashboard_group.command(
         name="token", description="Send the gateway token via DM (for configuring the web app).",
         extras={"i18n_desc": {
@@ -323,12 +491,14 @@ class WebDashboard(commands.Cog, name="pdc_webdashboard"):
         if not token:
             token = secrets.token_urlsafe(48)
             await self.config.token.set(token)
+            await self.config.token_rotated_at.set(int(time.time()))
         try:
             await ctx.author.send(box(token))
-            await ctx.send(_("Token per DM gesendet."))
+            await ctx.send(_("Token sent via DM."))
         except discord.Forbidden:
-            await ctx.send(_("Ich konnte dir keine DM senden. Bitte DMs aktivieren."))
+            await ctx.send(_("I could not send you a DM. Please enable DMs."))
 
+    @commands.is_owner()
     @dashboard_group.command(
         name="regen", description="Generate a new gateway token (the web app must be updated).",
         extras={"i18n_desc": {
@@ -338,8 +508,30 @@ class WebDashboard(commands.Cog, name="pdc_webdashboard"):
     )
     async def dashboard_regen(self, ctx: commands.Context) -> None:
         """Generate a new gateway token (the web app must be updated)."""
-        token = secrets.token_urlsafe(48)
-        await self.config.token.set(token)
-        await self._stop_gateway()
-        await self._start_gateway()
-        await ctx.send(_("Neues Token erzeugt und Gateway neu gestartet. Hole es mit `[p]pdcdashboard token`."))
+        await self._rotate_token(notify=False)
+        await ctx.send(_("New token generated and applied. Retrieve it with `[p]pdcdashboard token`."))
+
+    @commands.is_owner()
+    @dashboard_group.command(
+        name="tokenrotate", description="Set the automatic token rotation interval in hours (0 = off).",
+        extras={"i18n_desc": {
+            "de-DE": "Setzt das automatische Token-Rotationsintervall in Stunden (0 = aus).",
+            "en-US": "Set the automatic token rotation interval in hours (0 = off).",
+        }},
+    )
+    @app_commands.describe(hours="Rotation interval in hours (0 = off, max 720)")
+    async def dashboard_tokenrotate(self, ctx: commands.Context, hours: int) -> None:
+        """Configure automatic gateway-token rotation.
+
+        When active, the token is regenerated every ``hours`` hours; the bot
+        owners are notified via DM so the web app can be updated.
+        """
+        if not 0 <= hours <= 720:
+            await ctx.send(_("Value must be between {min} and {max}.").format(min=0, max=720))
+            return
+        await self.config.token_rotate_h.set(hours)
+        if hours:
+            await ctx.send(_("Token auto-rotation: {value}").format(
+                value=_("every {hours} h").format(hours=hours)))
+        else:
+            await ctx.send(_("Automatic token rotation disabled."))

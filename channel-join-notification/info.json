@@ -5,9 +5,7 @@
     "name": "channeljoinnotification",
     "short": "DM notification when joining configured channels",
     "description": "Sends a DM with a customizable text when users join specific voice/stage channels. Includes an ephemeral setup UI and a guild dashboard page.",
-    "version": "1.0.0",
     "requirements": [],
-    "permissions": [],
     "tags": [
         "notification",
         "dm",

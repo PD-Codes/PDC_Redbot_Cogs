@@ -84,13 +84,16 @@ except Exception:  # pdc_webdashboard not installed
     DashboardContext = object  # type: ignore
 
     def L(de, en=None):
-        return de
+        # Without the dashboard the labels are never rendered; keep English default.
+        return en if en is not None else de
 
     def tr(ctx, de, en):
-        return de
+        loc = str(getattr(ctx, "locale", "") or "")
+        return de if loc.lower().startswith("de") else en
 
     def tr_lang(lang, de, en):
-        return de
+        # Honour the per-guild language even without the dashboard (default: English).
+        return de if str(lang or "").lower().startswith("de") else en
 
 
 def register_dashboard(cog) -> bool:

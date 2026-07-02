@@ -73,14 +73,14 @@ class Registry:
             )
             self._contribs[contrib.key] = contrib
             count += 1
-        log.info("Registriert: %d Beiträge von Cog %s", count, cog_name)
+        log.info("Registered: %d contributions from cog %s", count, cog_name)
         return count
 
     def unregister_cog(self, cog: Any) -> None:
         cog_name = type(cog).__name__
         for key in [k for k, c in self._contribs.items() if c.cog_name == cog_name]:
             del self._contribs[key]
-        log.info("Beiträge von Cog %s entfernt", cog_name)
+        log.info("Contributions from cog %s removed", cog_name)
 
     # --- query ------------------------------------------------------------ #
     def get(self, key: str) -> Optional[Contribution]:
