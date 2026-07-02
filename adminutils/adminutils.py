@@ -890,8 +890,10 @@ class AdminUtils(commands.Cog):
         description="Create a new role with all server and channel permissions of an existing role.",
         extras={"i18n_desc": {"de-DE": "Neue Rolle mit allen Server- und Channel-Rechten einer Rolle erstellen.", "en-US": "Create a new role with all server and channel permissions of an existing role."}}
     )
-    @commands.bot_has_guild_permissions(manage_roles=True)
-    @has_perms(manage_roles=True)
+    @app_commands.guild_only()
+    @app_commands.checks.bot_has_permissions(manage_roles=True)
+    @app_commands.checks.has_permissions(manage_roles=True)
+    @app_commands.default_permissions(manage_roles=True)
     @app_commands.describe(
         source_role="Role to copy the permissions from",
         target_role_name="Name of the new role"
