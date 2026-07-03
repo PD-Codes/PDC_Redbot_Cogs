@@ -422,6 +422,10 @@ def _command_category(cmd) -> str:
         from redbot.core.commands import PrivilegeLevel as _PL  # type: ignore
         pl = getattr(getattr(cmd, "requires", None), "privilege_level", None)
         if pl is not None:
+            # Bot-owner commands (e.g. @commands.is_owner()) must never be
+            # advertised as Admin — only the bot owner can run them.
+            if pl >= _PL.BOT_OWNER:
+                return "Owner"
             if pl >= _PL.ADMIN:
                 return "Setup" if setupish else "Admin"
             if pl >= _PL.MOD:
