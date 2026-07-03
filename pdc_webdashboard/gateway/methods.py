@@ -2205,7 +2205,20 @@ async def serverstats_now(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any
 
 @dispatcher.method("serverstats.leaderboard")
 async def serverstats_leaderboard(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
-    return await _stats_guild_only(gateway, params, "stats_leaderboard")
+    ctx = await _build_context(gateway, params)
+    if ctx.guild is None:
+        raise RpcError(INVALID_PARAMS, "Unbekannte Guild")
+    await _require(gateway, ctx, "guild_member")
+    cog = _serverstats(gateway)
+    if cog is None:
+        raise RpcError(INVALID_PARAMS, "WebDashboardStats-Cog ist nicht geladen")
+    args = params.get("args") or {}
+    try:
+        limit = int(args.get("limit") or 10)
+    except (TypeError, ValueError):
+        limit = 10
+    limit = max(1, min(limit, 100))
+    return await cog.stats_leaderboard(ctx.guild, limit=limit)
 
 
 @dispatcher.method("serverstats.retention")

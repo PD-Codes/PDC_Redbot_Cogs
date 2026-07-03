@@ -778,16 +778,35 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
         daily = await self.config.guild(guild).invite_daily()
         logs = await self.config.guild(guild).invite_logs()
         inv_members = await self.config.guild(guild).invite_members()
+        inv_store = await self.config.guild(guild).invites()
+        inv_store = inv_store if isinstance(inv_store, dict) else {}
         codes = set()
         for k in keys:
             for code in (daily.get(k, {}) or {}).keys():
                 codes.add(code)
         series = {code: [int((daily.get(k, {}) or {}).get(code, 0)) for k in keys] for code in codes}
         top = sorted(((code, sum(series[code])) for code in codes), key=lambda x: x[1], reverse=True)[:10]
+
+        # Who owns each invite code, so the dashboard can show "name (code)"
+        # instead of the bare code. Sourced from the invites() store, which is
+        # kept up to date by on_invite_create/on_invite_delete/_track_invite_use
+        # (each entry holds the inviter's user id). Falls back silently (key
+        # omitted) for codes whose inviter left the server, is a bot/unknown,
+        # or that predate the "inviter_id" tracking.
+        code_owners: Dict[str, str] = {}
+        for code in codes:
+            inviter_id = int((inv_store.get(code) or {}).get("inviter_id", 0) or 0)
+            if not inviter_id:
+                continue
+            m = guild.get_member(inviter_id)
+            if m:
+                code_owners[code] = m.display_name
+
         return {
             "labels": keys,
             "series": series,
             "top_invites": [{"code": c, "count": n} for c, n in top],
+            "code_owners": code_owners,
             "recent_logs": list(reversed((logs or [])[-25:])),
             "top_members": self._top(guild, {k: v for k, v in (inv_members or {}).items()}, "member"),
         }
@@ -1023,8 +1042,9 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
             "playing": [{"name": n, "count": c} for n, c in top_playing],
         }
 
-    async def stats_leaderboard(self, guild: discord.Guild) -> Dict[str, Any]:
+    async def stats_leaderboard(self, guild: discord.Guild, limit: int = 10) -> Dict[str, Any]:
         """Top members this week (last 7 days) with rank change vs the previous week."""
+        limit = max(1, min(int(limit or 10), 100))
         all_keys = self._range_keys(14)
         this_keys, prev_keys = all_keys[-7:], all_keys[:7]
         mem = await self.config.guild(guild).msg_members()
@@ -1041,7 +1061,7 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
             now = totals(store, ks_now)
             prev = totals(store, ks_prev)
             prev_rank = {k: i + 1 for i, (k, _) in enumerate(sorted(prev.items(), key=lambda x: x[1], reverse=True))}
-            ordered = sorted(now.items(), key=lambda x: x[1], reverse=True)[:10]
+            ordered = sorted(now.items(), key=lambda x: x[1], reverse=True)[:limit]
             rows = []
             for i, (mid, val) in enumerate(ordered):
                 m = guild.get_member(int(mid)) if mid.isdigit() else None
