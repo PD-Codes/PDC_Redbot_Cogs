@@ -4,8 +4,9 @@ Fetches from meme-api.com (Reddit) with a direct Reddit JSON fallback when the
 primary API is down. ``meme`` posts on demand; an optional interval auto-posts
 into a channel. Configurable subreddit sources (validated on set) and NSFW
 filtering. Robust external API handling: timeout, retry with exponential
-backoff, TTL cache as fallback, per-channel de-duplication. Opt-in per guild,
-bilingual (DE/EN, default en-US), web dashboard integration via the drop-in.
+backoff, per-channel de-duplication. Every fetch is fresh — nothing is cached
+or replayed across calls. Opt-in per guild, bilingual (DE/EN, default en-US),
+web dashboard integration via the drop-in.
 """
 from __future__ import annotations
 
@@ -15,7 +16,7 @@ import random
 import re
 import time
 from collections import deque
-from typing import Deque, Dict, Optional, Tuple
+from typing import Deque, Dict, Optional
 
 import aiohttp
 import discord
@@ -44,8 +45,6 @@ _UA = "PDC-Redbot-MemeGen/1.1 (Red-DiscordBot cog)"
 _SUBREDDIT_RE = re.compile(r"^[A-Za-z0-9_]{2,21}$")
 _IMAGE_EXT = (".jpg", ".jpeg", ".png", ".gif", ".webp")
 
-CACHE_TTL = 600  # seconds a cached meme stays valid as fallback
-CACHE_POOL_SIZE = 10  # distinct fallback memes kept per source key
 RECENT_PER_CHANNEL = 20  # de-dup recently shown memes per channel
 HTTP_RETRIES = 3
 HTTP_TIMEOUT = 10  # seconds
@@ -68,13 +67,8 @@ class MemeGen(commands.Cog):
         )
         self._task: Optional[asyncio.Task] = None
         self._session: Optional[aiohttp.ClientSession] = None
-        # source key -> small pool of recent good responses, newest last —
-        # used as fallback when both live sources fail. A pool (not just the
-        # single last response) lets repeated fallback serves still pick a
-        # meme the channel hasn't already seen instead of reposting one item
-        # forever.
-        self._cache: Dict[str, Deque[Tuple[float, dict]]] = {}
-        # channel_id -> recently posted meme URLs
+        # channel_id -> recently posted meme URLs (de-dup only, no meme
+        # content is ever stored/replayed — every fetch is fresh)
         self._recent: Dict[int, Deque[str]] = {}
 
     async def cog_load(self) -> None:
@@ -98,7 +92,7 @@ class MemeGen(commands.Cog):
         return await self.config.guild(guild).language()
 
     # ------------------------------------------------------------------ #
-    # HTTP helpers (timeout, retry + backoff, fallback source, cache)
+    # HTTP helpers (timeout, retry + backoff, fallback source)
     # ------------------------------------------------------------------ #
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -175,58 +169,30 @@ class MemeGen(commands.Cog):
 
     async def _fetch(self, subreddit: Optional[str], *, allow_nsfw: bool = False,
                      channel_id: Optional[int] = None) -> Optional[dict]:
-        """Fetch a meme: primary API, then Reddit fallback, then TTL cache."""
-        key = subreddit or "_default"
+        """Fetch a meme: always a fresh live request, no cached/reused content.
+
+        Every call hits the primary API (with a few retries to skip an
+        already-shown meme), then the direct Reddit fallback if that fails.
+        Nothing is ever stored and replayed on a later call — each /meme
+        invocation is fully independent, and if both live sources fail this
+        simply returns None (caller shows an error) instead of a stale repeat.
+        """
         recent = self._recent.setdefault(channel_id or 0, deque(maxlen=RECENT_PER_CHANNEL))
 
         js = None
-        fresh = False
         for _ in range(3):  # de-dup: retry a few times for an unseen meme
             js = await self._fetch_primary(subreddit, allow_nsfw)
             if js is None:
                 break
             if js.get("url") not in recent:
-                fresh = True
                 break
         if js is None:
             js = await self._fetch_fallback(subreddit, allow_nsfw)
             if js is not None:
-                fresh = True
-                log.info("MemeGen: primary API down, used Reddit fallback for %r", key)
-        if js is None:
-            js = self._serve_from_cache(key, recent)
-        if js is not None:
-            # Only extend the pool on a genuinely fresh fetch — a cache-served
-            # meme must not be re-added, or a single stale entry keeps renewing
-            # itself and every /meme call (while both live sources are down)
-            # ends up posting the exact same meme with "independent" posts
-            # collapsing into identical content.
-            if fresh:
-                pool = self._cache.setdefault(key, deque(maxlen=CACHE_POOL_SIZE))
-                pool.append((time.time(), js))
-            if js.get("url"):
-                recent.append(js["url"])
+                log.info("MemeGen: primary API down, used Reddit fallback for %r", subreddit or "_default")
+        if js is not None and js.get("url"):
+            recent.append(js["url"])
         return js
-
-    def _serve_from_cache(self, key: str, recent: Deque[str]) -> Optional[dict]:
-        """Fall back to a pooled past response when both live sources fail.
-
-        Prefers an entry the channel hasn't already seen so that repeated
-        /meme calls during an outage don't just repost the same meme over
-        and over; only repeats one if the whole (unexpired) pool is used up.
-        """
-        pool = self._cache.get(key)
-        if not pool:
-            return None
-        now = time.time()
-        candidates = [js for ts, js in pool if now - ts <= CACHE_TTL]
-        if not candidates:
-            return None
-        unseen = [js for js in candidates if js.get("url") not in recent]
-        chosen = random.choice(unseen) if unseen else candidates[-1]
-        log.info("MemeGen: serving cached meme for %r (%d candidates, %d unseen)",
-                  key, len(candidates), len(unseen))
-        return chosen
 
     async def _validate_subreddit(self, name: str) -> bool:
         """Test-fetch a subreddit to confirm it exists and serves memes."""
