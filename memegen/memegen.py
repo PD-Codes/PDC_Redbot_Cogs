@@ -5,18 +5,23 @@ primary API is down. ``meme`` posts on demand; an optional interval auto-posts
 into a channel. Configurable subreddit sources (validated on set) and NSFW
 filtering. Robust external API handling: timeout, retry with exponential
 backoff, per-channel de-duplication. Every fetch is fresh — nothing is cached
-or replayed across calls. Opt-in per guild, bilingual (DE/EN, default en-US),
-web dashboard integration via the drop-in.
+or replayed across calls. Images are downloaded and posted as real file
+attachments (not hot-linked URLs), so every message owns a distinct Discord
+asset instead of several messages pointing at the same remote image URL.
+Opt-in per guild, bilingual (DE/EN, default en-US), web dashboard integration
+via the drop-in.
 """
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
+import mimetypes
 import random
 import re
 import time
 from collections import deque
-from typing import Deque, Dict, Optional
+from typing import Deque, Dict, Optional, Tuple
 
 import aiohttp
 import discord
@@ -45,6 +50,7 @@ _UA = "PDC-Redbot-MemeGen/1.1 (Red-DiscordBot cog)"
 _SUBREDDIT_RE = re.compile(r"^[A-Za-z0-9_]{2,21}$")
 _IMAGE_EXT = (".jpg", ".jpeg", ".png", ".gif", ".webp")
 
+MAX_IMAGE_BYTES = 8 * 1024 * 1024  # Discord's non-boosted upload cap
 RECENT_PER_CHANNEL = 20  # de-dup recently shown memes per channel
 HTTP_RETRIES = 3
 HTTP_TIMEOUT = 10  # seconds
@@ -176,11 +182,21 @@ class MemeGen(commands.Cog):
         Nothing is ever stored and replayed on a later call — each /meme
         invocation is fully independent, and if both live sources fail this
         simply returns None (caller shows an error) instead of a stale repeat.
+
+        meme-api.com itself has been observed to return the byte-identical
+        post for requests made within roughly the same second (its own
+        server-side response cache, outside our control) — two /meme calls
+        fired in quick succession can get the exact same link back even
+        though each is a genuinely fresh HTTP request. A short delay before
+        each retry gives that upstream cache time to roll over so repeated
+        commands actually land on a different meme.
         """
         recent = self._recent.setdefault(channel_id or 0, deque(maxlen=RECENT_PER_CHANNEL))
 
         js = None
-        for _ in range(3):  # de-dup: retry a few times for an unseen meme
+        for attempt in range(3):  # de-dup: retry a few times for an unseen meme
+            if attempt > 0:
+                await asyncio.sleep(0.75 * attempt)  # let meme-api.com's cache roll over
             js = await self._fetch_primary(subreddit, allow_nsfw)
             if js is None:
                 break
@@ -204,17 +220,69 @@ class MemeGen(commands.Cog):
         js = await self._fetch_fallback(name, True)
         return js is not None
 
-    def _embed(self, js: dict) -> discord.Embed:
+    async def _download_image(self, url: str) -> Optional[Tuple[bytes, str]]:
+        """Download the meme image so it can be posted as a real attachment.
+
+        Posting a real ``discord.File`` (instead of only linking the remote
+        URL via ``set_image(url=...)``) guarantees every message gets its own
+        distinct Discord CDN asset. Two messages hot-linking the identical
+        external URL can otherwise end up sharing Discord's URL-keyed embed
+        image cache, which is the leading suspect for older messages seeming
+        to change when a later post reuses the same source URL.
+        """
+        if not url:
+            return None
+        ext = next((e for e in _IMAGE_EXT if url.lower().split("?")[0].endswith(e)), None)
+        try:
+            session = await self._get_session()
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return None
+                if not ext:
+                    ctype = resp.headers.get("Content-Type", "").split(";")[0].strip()
+                    ext = mimetypes.guess_extension(ctype) or ".jpg"
+                    if ext == ".jpe":
+                        ext = ".jpg"
+                if resp.content_length and resp.content_length > MAX_IMAGE_BYTES:
+                    return None
+                data = bytearray()
+                async for chunk in resp.content.iter_chunked(65536):
+                    data.extend(chunk)
+                    if len(data) > MAX_IMAGE_BYTES:
+                        return None
+                return bytes(data), ext
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("MemeGen: failed to download image %s", url)
+            return None
+
+    async def _build_post(self, js: dict) -> Tuple[discord.Embed, Optional[discord.File]]:
+        """Build the embed and, when possible, a file attachment for the image.
+
+        Falls back to a hot-linked embed image if the download fails (source
+        unreachable, too large, ...) so a meme still gets posted — just
+        without the "distinct asset per message" guarantee in that edge case.
+        """
         e = discord.Embed(
             title=(js.get("title") or "Meme")[:256],
             url=js.get("postLink"),
             colour=discord.Colour.blurple(),
         )
-        e.set_image(url=js.get("url"))
         sub = js.get("subreddit")
         if sub:
             e.set_footer(text=f"r/{sub}")
-        return e
+
+        downloaded = await self._download_image(js.get("url") or "")
+        if downloaded is None:
+            e.set_image(url=js.get("url"))
+            return e, None
+
+        data, ext = downloaded
+        filename = f"meme{ext}"
+        file = discord.File(io.BytesIO(data), filename=filename)
+        e.set_image(url=f"attachment://{filename}")
+        return e, file
 
     @staticmethod
     def _error_embed(lang: str) -> discord.Embed:
@@ -278,8 +346,9 @@ class MemeGen(commands.Cog):
             )
             await self.config.guild(guild).last_post.set(now)
             if js:
+                embed, file = await self._build_post(js)
                 try:
-                    await channel.send(embed=self._embed(js))
+                    await channel.send(embed=embed, file=file)
                 except discord.HTTPException:
                     pass
 
@@ -309,7 +378,8 @@ class MemeGen(commands.Cog):
         if not js:
             await ctx.send(embed=self._error_embed(lang))
             return
-        await ctx.send(embed=self._embed(js))
+        embed, file = await self._build_post(js)
+        await ctx.send(embed=embed, file=file)
 
     @commands.hybrid_group(name="memeset")
     @commands.admin_or_permissions(manage_guild=True)
