@@ -45,6 +45,7 @@ _SUBREDDIT_RE = re.compile(r"^[A-Za-z0-9_]{2,21}$")
 _IMAGE_EXT = (".jpg", ".jpeg", ".png", ".gif", ".webp")
 
 CACHE_TTL = 600  # seconds a cached meme stays valid as fallback
+CACHE_POOL_SIZE = 10  # distinct fallback memes kept per source key
 RECENT_PER_CHANNEL = 20  # de-dup recently shown memes per channel
 HTTP_RETRIES = 3
 HTTP_TIMEOUT = 10  # seconds
@@ -67,8 +68,12 @@ class MemeGen(commands.Cog):
         )
         self._task: Optional[asyncio.Task] = None
         self._session: Optional[aiohttp.ClientSession] = None
-        # source key -> (timestamp, meme dict) — last good response as fallback
-        self._cache: Dict[str, Tuple[float, dict]] = {}
+        # source key -> small pool of recent good responses, newest last —
+        # used as fallback when both live sources fail. A pool (not just the
+        # single last response) lets repeated fallback serves still pick a
+        # meme the channel hasn't already seen instead of reposting one item
+        # forever.
+        self._cache: Dict[str, Deque[Tuple[float, dict]]] = {}
         # channel_id -> recently posted meme URLs
         self._recent: Dict[int, Deque[str]] = {}
 
@@ -175,26 +180,53 @@ class MemeGen(commands.Cog):
         recent = self._recent.setdefault(channel_id or 0, deque(maxlen=RECENT_PER_CHANNEL))
 
         js = None
+        fresh = False
         for _ in range(3):  # de-dup: retry a few times for an unseen meme
             js = await self._fetch_primary(subreddit, allow_nsfw)
             if js is None:
                 break
             if js.get("url") not in recent:
+                fresh = True
                 break
         if js is None:
             js = await self._fetch_fallback(subreddit, allow_nsfw)
             if js is not None:
+                fresh = True
                 log.info("MemeGen: primary API down, used Reddit fallback for %r", key)
         if js is None:
-            cached = self._cache.get(key)
-            if cached and time.time() - cached[0] <= CACHE_TTL:
-                js = cached[1]
-                log.info("MemeGen: serving cached meme for %r", key)
+            js = self._serve_from_cache(key, recent)
         if js is not None:
-            self._cache[key] = (time.time(), js)
+            # Only extend the pool on a genuinely fresh fetch — a cache-served
+            # meme must not be re-added, or a single stale entry keeps renewing
+            # itself and every /meme call (while both live sources are down)
+            # ends up posting the exact same meme with "independent" posts
+            # collapsing into identical content.
+            if fresh:
+                pool = self._cache.setdefault(key, deque(maxlen=CACHE_POOL_SIZE))
+                pool.append((time.time(), js))
             if js.get("url"):
                 recent.append(js["url"])
         return js
+
+    def _serve_from_cache(self, key: str, recent: Deque[str]) -> Optional[dict]:
+        """Fall back to a pooled past response when both live sources fail.
+
+        Prefers an entry the channel hasn't already seen so that repeated
+        /meme calls during an outage don't just repost the same meme over
+        and over; only repeats one if the whole (unexpired) pool is used up.
+        """
+        pool = self._cache.get(key)
+        if not pool:
+            return None
+        now = time.time()
+        candidates = [js for ts, js in pool if now - ts <= CACHE_TTL]
+        if not candidates:
+            return None
+        unseen = [js for js in candidates if js.get("url") not in recent]
+        chosen = random.choice(unseen) if unseen else candidates[-1]
+        log.info("MemeGen: serving cached meme for %r (%d candidates, %d unseen)",
+                  key, len(candidates), len(unseen))
+        return chosen
 
     async def _validate_subreddit(self, name: str) -> bool:
         """Test-fetch a subreddit to confirm it exists and serves memes."""
