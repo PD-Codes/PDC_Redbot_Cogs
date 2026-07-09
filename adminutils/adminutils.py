@@ -1,5 +1,7 @@
 import discord
 import asyncio
+import html as html_mod
+from collections import defaultdict
 from discord import app_commands
 from datetime import timedelta
 from typing import Any, Dict, Literal, Optional, List
@@ -165,6 +167,44 @@ class AdminUtils(commands.Cog):
         except Exception:
             self._dashboard_attached = False
 
+    @staticmethod
+    def _safe_format(template: str, **kwargs: Any) -> str:
+        """Format a user-supplied template without raising on unknown keys."""
+        try:
+            return str(template).format_map(defaultdict(str, **kwargs))
+        except Exception:
+            return str(template)
+
+    async def _check_mod_target(
+        self, ctx: commands.Context, member: discord.Member
+    ) -> Optional[str]:
+        """Hierarchy checks for kick/ban/timeout.
+
+        Returns an error message when the target must not be moderated,
+        otherwise None.
+        """
+        guild = ctx.guild
+        lang = await self.config.guild(guild).language()
+        if member.id == guild.owner_id:
+            return tr_lang(
+                lang,
+                "❌ Der Server-Owner kann nicht moderiert werden.",
+                "❌ The server owner cannot be moderated.",
+            )
+        if ctx.author.id != guild.owner_id and member.top_role >= ctx.author.top_role:
+            return tr_lang(
+                lang,
+                "❌ Das Mitglied hat eine höhere oder gleiche Rolle als du.",
+                "❌ That member has a higher or equal role than you.",
+            )
+        if member.top_role >= guild.me.top_role:
+            return tr_lang(
+                lang,
+                "❌ Das Mitglied hat eine höhere oder gleiche Rolle als der Bot.",
+                "❌ That member has a higher or equal role than the bot.",
+            )
+        return None
+
     # small helper so ephemeral is only used for slash
     async def _reply(self, ctx: commands.Context, content: str, **kwargs):
         if getattr(ctx, "interaction", None) is not None:
@@ -271,11 +311,20 @@ class AdminUtils(commands.Cog):
         reason: Optional[str] = None
     ):
         """Kick a member from the server."""
-        await member.kick(reason=reason or f"Kicked by {ctx.author}")
+        lang = await self.config.guild(ctx.guild).language()
+        err = await self._check_mod_target(ctx, member)
+        if err:
+            return await self._reply(ctx, err)
+        try:
+            await member.kick(reason=reason or f"Kicked by {ctx.author}")
+        except discord.Forbidden:
+            return await self._reply(ctx, tr_lang(lang, "❌ Keine Berechtigung, dieses Mitglied zu kicken.", "❌ Missing permission to kick that member."))
+        except discord.HTTPException:
+            return await self._reply(ctx, tr_lang(lang, "❌ Kick fehlgeschlagen (Discord-API-Fehler).", "❌ Kick failed (Discord API error)."))
         templates = await self.config.guild(ctx.guild).templates()
         await self._reply(
             ctx,
-            templates["kick_success"].format(member=member.mention, reason=reason or "—"),
+            self._safe_format(templates["kick_success"], member=member.mention, reason=reason or "—"),
         )
         await self._log_to_adminprotocol(ctx.guild, ctx.author, "kick", target=member, reason=reason)
 
@@ -298,15 +347,25 @@ class AdminUtils(commands.Cog):
         reason: Optional[str] = None
     ):
         """Ban a member from the server."""
-        await ctx.guild.ban(
-            member,
-            reason=reason or f"Banned by {ctx.author}",
-            delete_message_seconds=delete_message_days * 24 * 3600
-        )
+        lang = await self.config.guild(ctx.guild).language()
+        err = await self._check_mod_target(ctx, member)
+        if err:
+            return await self._reply(ctx, err)
+        try:
+            await ctx.guild.ban(
+                member,
+                reason=reason or f"Banned by {ctx.author}",
+                delete_message_seconds=delete_message_days * 24 * 3600
+            )
+        except discord.Forbidden:
+            return await self._reply(ctx, tr_lang(lang, "❌ Keine Berechtigung, dieses Mitglied zu bannen.", "❌ Missing permission to ban that member."))
+        except discord.HTTPException:
+            return await self._reply(ctx, tr_lang(lang, "❌ Bann fehlgeschlagen (Discord-API-Fehler).", "❌ Ban failed (Discord API error)."))
         templates = await self.config.guild(ctx.guild).templates()
         await self._reply(
             ctx,
-            templates["ban_success"].format(
+            self._safe_format(
+                templates["ban_success"],
                 member=member.mention,
                 reason=reason or "—",
                 delete_days=delete_message_days,
@@ -333,12 +392,22 @@ class AdminUtils(commands.Cog):
         reason: Optional[str] = None
     ):
         """Time out (temporarily mute) a member."""
+        lang = await self.config.guild(ctx.guild).language()
+        err = await self._check_mod_target(ctx, member)
+        if err:
+            return await self._reply(ctx, err)
         until = discord.utils.utcnow() + timedelta(minutes=minutes)
-        await member.timeout(until, reason=reason or f"Timeout by {ctx.author}")
+        try:
+            await member.timeout(until, reason=reason or f"Timeout by {ctx.author}")
+        except discord.Forbidden:
+            return await self._reply(ctx, tr_lang(lang, "❌ Keine Berechtigung, dieses Mitglied stummzuschalten.", "❌ Missing permission to time out that member."))
+        except discord.HTTPException:
+            return await self._reply(ctx, tr_lang(lang, "❌ Timeout fehlgeschlagen (Discord-API-Fehler).", "❌ Timeout failed (Discord API error)."))
         templates = await self.config.guild(ctx.guild).templates()
         await self._reply(
             ctx,
-            templates["timeout_success"].format(
+            self._safe_format(
+                templates["timeout_success"],
                 member=member.mention,
                 minutes=minutes,
                 reason=reason or "—",
@@ -486,10 +555,15 @@ class AdminUtils(commands.Cog):
         # If we never sent a followup message (prefix or no progress_msg):
         if progress_msg is None:
             templates = await self.config.guild(ctx.guild).templates()
-            await self._reply(
-                ctx,
-                templates["purge_success"].format(deleted=total_deleted, exceptions=len(except_ids)),
+            text = self._safe_format(
+                templates["purge_success"], deleted=total_deleted, exceptions=len(except_ids)
             )
+            # Use ctx.send: the invoking message may have been purged, so a
+            # reply reference would fail.
+            if getattr(ctx, "interaction", None) is not None:
+                await ctx.send(text, ephemeral=True)
+            else:
+                await ctx.send(text)
 
         await self._log_to_adminprotocol(
             ctx.guild, ctx.author, "purge",
@@ -546,10 +620,13 @@ class AdminUtils(commands.Cog):
         except discord.HTTPException as e:
             return await self._reply(ctx, tr_lang(lang, f"❌ HTTP-Fehler beim Löschen: {e}", f"❌ HTTP error while deleting: {e}"))
 
-        await self._reply(
-            ctx,
-            tr_lang(lang, f"✅ {len(deleted)} Nachrichten (≤14 Tage) gelöscht. Ausnahmen: {len(except_ids)}", f"✅ {len(deleted)} messages (≤14 days) deleted. Exceptions: {len(except_ids)}")
-        )
+        # Use ctx.send: the invoking message may have been purged, so a
+        # reply reference would fail.
+        done_text = tr_lang(lang, f"✅ {len(deleted)} Nachrichten (≤14 Tage) gelöscht. Ausnahmen: {len(except_ids)}", f"✅ {len(deleted)} messages (≤14 days) deleted. Exceptions: {len(except_ids)}")
+        if getattr(ctx, "interaction", None) is not None:
+            await ctx.send(done_text, ephemeral=True)
+        else:
+            await ctx.send(done_text)
         await self._log_to_adminprotocol(
             ctx.guild, ctx.author, "purgefast",
             extra=f"#{ctx.channel} • {len(deleted)} deleted"
@@ -1064,10 +1141,10 @@ class AdminUtils(commands.Cog):
 <h2>AdminUtils - Guild Dashboard</h2>
 <p><b>Variables:</b> <code>{{member}}</code> <code>{{reason}}</code> <code>{{minutes}}</code> <code>{{delete_days}}</code> <code>{{deleted}}</code> <code>{{exceptions}}</code></p>
 <form method='post'>
-<label>kick_success</label><textarea rows='2' name='kick_success'>{templates.get("kick_success","")}</textarea><br>
-<label>ban_success</label><textarea rows='2' name='ban_success'>{templates.get("ban_success","")}</textarea><br>
-<label>timeout_success</label><textarea rows='2' name='timeout_success'>{templates.get("timeout_success","")}</textarea><br>
-<label>purge_success</label><textarea rows='2' name='purge_success'>{templates.get("purge_success","")}</textarea><br><br>
+<label>kick_success</label><textarea rows='2' name='kick_success'>{html_mod.escape(str(templates.get("kick_success","")))}</textarea><br>
+<label>ban_success</label><textarea rows='2' name='ban_success'>{html_mod.escape(str(templates.get("ban_success","")))}</textarea><br>
+<label>timeout_success</label><textarea rows='2' name='timeout_success'>{html_mod.escape(str(templates.get("timeout_success","")))}</textarea><br>
+<label>purge_success</label><textarea rows='2' name='purge_success'>{html_mod.escape(str(templates.get("purge_success","")))}</textarea><br><br>
 <button type='submit'>Save</button>
 </form>
 </div>

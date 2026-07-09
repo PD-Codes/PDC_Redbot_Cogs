@@ -129,8 +129,23 @@ class GuildToolsPollExport(commands.Cog):
         name="export-poll", description="Export a native Discord poll as CSV (;-separated).",
         extras={"i18n_desc": {"de-DE": "Native Discord-Umfrage als CSV exportieren (;-getrennt).", "en-US": "Export a native Discord poll as CSV (;-separated)."}}
     )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_messages=True)
     async def export_poll(self, interaction: discord.Interaction, poll: str, mode: app_commands.Choice[str]):
         """Export the results of a poll."""
+        # Runtime permission check (default_permissions can be overridden).
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+        is_owner = await self.bot.is_owner(interaction.user)
+        member_perms = getattr(interaction.user, "guild_permissions", None)
+        if not is_owner and (member_perms is None or not member_perms.manage_messages):
+            return await interaction.response.send_message(
+                "You need the **Manage Messages** permission to use this command.",
+                ephemeral=True,
+            )
+
         await interaction.response.defer(thinking=True, ephemeral=True)
         lang = await self._lang(interaction.guild)
 
@@ -140,16 +155,23 @@ class GuildToolsPollExport(commands.Cog):
         except Exception:
             return await interaction.followup.send(tr_lang(lang, "❌ Ungültige Umfrage-Auswahl.", "❌ Invalid poll selection."), ephemeral=True)
 
-        # fetch channel (may be a different channel/thread)
-        ch = interaction.guild.get_channel(chan_id)
+        # fetch channel (may be a different channel/thread) — guild-local only
+        ch = interaction.guild.get_channel_or_thread(chan_id)
         if ch is None:
             try:
-                ch = await interaction.client.fetch_channel(chan_id)
+                ch = await interaction.guild.fetch_channel(chan_id)
             except Exception:
                 return await interaction.followup.send(tr_lang(lang, "❌ Ziel-Channel nicht gefunden/zugreifbar.", "❌ Target channel not found/accessible."), ephemeral=True)
+        if getattr(ch, "guild", None) is None or ch.guild.id != interaction.guild.id:
+            return await interaction.followup.send(tr_lang(lang, "❌ Der Ziel-Channel gehört nicht zu diesem Server.", "❌ The target channel does not belong to this server."), ephemeral=True)
 
         if not isinstance(ch, (discord.TextChannel, discord.Thread, discord.ForumChannel)):
             return await interaction.followup.send(tr_lang(lang, "❌ Dieser Befehl funktioniert nur in Textchannels/Threads.", "❌ This command only works in text channels/threads."), ephemeral=True)
+
+        # The caller must be able to read the target channel's history.
+        caller_perms = ch.permissions_for(interaction.user)
+        if not (caller_perms.read_message_history and caller_perms.view_channel):
+            return await interaction.followup.send(tr_lang(lang, "❌ Du hast keinen Lesezugriff auf den Ziel-Channel.", "❌ You do not have read access to the target channel."), ephemeral=True)
 
         # load message
         try:

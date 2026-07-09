@@ -1,9 +1,12 @@
 import discord
 from redbot.core import commands, Config
+import logging
 import uuid
 from typing import Any, Dict, Optional
 import json
 import html
+
+log = logging.getLogger("red.pdc.reactionrole")
 
 from .pdc_dashboard import (
     dashboard_widget, dashboard_panel, dashboard_list, WidgetData,
@@ -328,6 +331,26 @@ class ReactionRole(commands.Cog):
         guild = ctx.guild
         channel = ctx.channel
 
+        # Role hierarchy / safety checks
+        if role.managed or role.is_default():
+            return await ctx.send(tr_lang(
+                lang,
+                "❌ Diese Rolle kann nicht vergeben werden (verwaltete oder @everyone-Rolle).",
+                "❌ That role cannot be assigned (managed or @everyone role).",
+            ))
+        if role >= guild.me.top_role:
+            return await ctx.send(tr_lang(
+                lang,
+                "❌ Diese Rolle ist höher oder gleich der höchsten Rolle des Bots.",
+                "❌ That role is higher than or equal to the bot's top role.",
+            ))
+        if ctx.author != guild.owner and role >= ctx.author.top_role:
+            return await ctx.send(tr_lang(
+                lang,
+                "❌ Du kannst keine Rolle binden, die höher oder gleich deiner höchsten Rolle ist.",
+                "❌ You cannot bind a role that is higher than or equal to your top role.",
+            ))
+
         try:
             message = await channel.fetch_message(message_id)
         except discord.NotFound:
@@ -428,7 +451,9 @@ class ReactionRole(commands.Cog):
             return
 
         guild = self.bot.get_guild(payload.guild_id)
-        member = guild.get_member(payload.user_id)
+        if guild is None:
+            return
+        member = payload.member or guild.get_member(payload.user_id)
 
         if member is None or member.bot:
             return
@@ -442,7 +467,13 @@ class ReactionRole(commands.Cog):
             ):
                 role = guild.get_role(entry["role_id"])
                 if role:
-                    await member.add_roles(role, reason="ReactionRole")
+                    try:
+                        await member.add_roles(role, reason="ReactionRole")
+                    except (discord.Forbidden, discord.HTTPException):
+                        log.warning(
+                            "ReactionRole: failed to add role %s to %s in guild %s",
+                            role.id, member.id, guild.id, exc_info=True,
+                        )
                 break
 
     @commands.Cog.listener()
@@ -451,9 +482,17 @@ class ReactionRole(commands.Cog):
             return
 
         guild = self.bot.get_guild(payload.guild_id)
+        if guild is None:
+            return
+        # payload.member is not provided on reaction removal.
         member = guild.get_member(payload.user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(payload.user_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return
 
-        if member is None or member.bot:
+        if member.bot:
             return
 
         data = await self.config.guild(guild).reactionroles()
@@ -465,7 +504,13 @@ class ReactionRole(commands.Cog):
             ):
                 role = guild.get_role(entry["role_id"])
                 if role:
-                    await member.remove_roles(role, reason="ReactionRole")
+                    try:
+                        await member.remove_roles(role, reason="ReactionRole")
+                    except (discord.Forbidden, discord.HTTPException):
+                        log.warning(
+                            "ReactionRole: failed to remove role %s from %s in guild %s",
+                            role.id, member.id, guild.id, exc_info=True,
+                        )
                 break
 
     @commands.hybrid_command(
@@ -808,7 +853,9 @@ class ReactionRole(commands.Cog):
         channel_options = ["<option value=''>-- select channel --</option>"] + [
             f"<option value='{c.id}'>{html.escape('#' + c.name)}</option>" for c in guild.text_channels
         ]
-        panel_json = html.escape(json.dumps(panel_data_for_js))
+        # Embed as a JS object literal; only escape "</" so the JSON cannot
+        # break out of the <script> block.
+        panel_json = json.dumps(panel_data_for_js).replace("</", "<\\/")
 
         source = f"""
 <style>
@@ -868,7 +915,7 @@ class ReactionRole(commands.Cog):
 </div>
 </div>
 <script>
-const panelData = JSON.parse("{panel_json}");
+const panelData = {panel_json};
 let mapIndex = 1;
 function addRow(emoji="", roleId="") {{
   mapIndex += 1;

@@ -120,12 +120,44 @@ class GuildTools(commands.Cog):
         # In-memory token cache (process-local)
         self._token_mem = ""
         self._token_mem_exp = 0
+        # Presence tracking buffer: guild_id -> {member_id(str): iso timestamp}
+        self._presence_buffer: dict = {}
+        self._presence_flush_task: Optional[asyncio.Task] = None
 
     async def cog_load(self) -> None:
         register_dashboard(self)
+        self._presence_flush_task = asyncio.create_task(self._presence_flush_loop())
 
-    def cog_unload(self) -> None:
+    async def cog_unload(self) -> None:
         unregister_dashboard(self)
+        if self._presence_flush_task:
+            self._presence_flush_task.cancel()
+            self._presence_flush_task = None
+        try:
+            await self._flush_presence_buffer()
+        except Exception:
+            pass
+
+    async def _presence_flush_loop(self) -> None:
+        """Flush buffered presence timestamps to the config every 60 seconds."""
+        try:
+            while True:
+                await asyncio.sleep(60)
+                try:
+                    await self._flush_presence_buffer()
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            pass
+
+    async def _flush_presence_buffer(self) -> None:
+        if not self._presence_buffer:
+            return
+        buffered, self._presence_buffer = self._presence_buffer, {}
+        for gid, entries in buffered.items():
+            # Merge into the stored dict instead of overwriting it wholesale.
+            async with self.config.guild_from_id(gid).last_seen() as data:
+                data.update(entries)
 
     @dashboard_widget("tracked_members", L("Erfasste Mitglieder", "Tracked Members"), size="sm", permission="guild_member")
     async def tracked_members_widget(self, ctx):
@@ -203,9 +235,9 @@ class GuildTools(commands.Cog):
         if not (became_online or became_offline):
             return
         now_iso = datetime.now(timezone.utc).isoformat()
-        data = await self.config.guild(after.guild).last_seen()
-        data[str(after.id)] = now_iso
-        await self.config.guild(after.guild).last_seen.set(data)
+        # Buffer in memory; a background task flushes periodically to avoid
+        # a full config write on every presence change.
+        self._presence_buffer.setdefault(after.guild.id, {})[str(after.id)] = now_iso
 
     # ---------- Guild-level configuration (admin) ----------
     @commands.hybrid_group(name="guildtoolsset", aliases=["gtset"])
@@ -630,6 +662,20 @@ class GuildTools(commands.Cog):
     @app_commands.describe(client_id="Blizzard API client ID", client_secret="Blizzard API client secret")
     async def set_blizzard_credentials(self, ctx: commands.Context, client_id: str, client_secret: str):
         """Owner-only: Set the Blizzard API client ID/secret (fallback when ENV is not used)."""
+        # Refuse prefix invocation in a guild: the secret would be visible in chat.
+        if ctx.interaction is None and ctx.guild is not None:
+            try:
+                await ctx.message.delete()
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+            await ctx.send(tr_lang(
+                await self._lang(ctx.guild),
+                "⚠️ Aus Sicherheitsgründen bitte den Slash-Command `/setblizzard` oder eine DM verwenden "
+                "(das Secret wäre sonst im Chat sichtbar).",
+                "⚠️ For security reasons please use the `/setblizzard` slash command or a DM "
+                "(the secret would otherwise be visible in chat).",
+            ))
+            return
         await self.config.blizz_client_id.set(client_id)
         await self.config.blizz_client_secret.set(client_secret)
         await self.config.blizz_token.set("")

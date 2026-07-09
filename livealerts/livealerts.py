@@ -313,21 +313,35 @@ class LiveAlerts(commands.Cog):
             subs = gconf.get("subs") or {}
             if not subs:
                 continue
-            updated = dict(subs)
-            dirty = False
+            # Process (network I/O) outside of any config lock, then merge the
+            # results per subscription ID so concurrent edits are not lost.
+            processed: Dict[str, dict] = {}
             for sid, sub in subs.items():
                 sub = dict(sub)
                 if now - float(sub.get("last_fetch") or 0) < interval:
                     continue
                 if sub.get("type") == "twitch":
-                    updated[sid] = await self._process_twitch(guild, sub, live_map)
+                    processed[sid] = await self._process_twitch(guild, sub, live_map)
                 elif sub.get("type") == "youtube":
-                    updated[sid] = await self._process_youtube(guild, sub)
-                else:
-                    continue
-                dirty = True
-            if dirty:
-                await self.config.guild(guild).subs.set(updated)
+                    processed[sid] = await self._process_youtube(guild, sub)
+            if processed:
+                async with self.config.guild(guild).subs() as current:
+                    for sid, result in processed.items():
+                        existing = current.get(sid)
+                        if existing is None:
+                            continue  # subscription removed meanwhile
+                        if (
+                            existing.get("type") != result.get("type")
+                            or existing.get("key") != result.get("key")
+                        ):
+                            continue  # sub edited meanwhile; state is stale
+                        # Only merge poll-state keys; keep user-editable fields.
+                        for key in ("last_fetch", "last_status", "last_error",
+                                    "live_id", "live_message", "seen", "seeded",
+                                    "name"):
+                            if key in result:
+                                existing[key] = result[key]
+                        current[sid] = existing
 
     # ------------------------------------------------------------------ #
     # Per-subscription processing

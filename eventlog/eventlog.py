@@ -199,6 +199,17 @@ class EventLog(commands.Cog):
             return False
         return bool(await self.config.guild(guild).ignore_bots())
 
+    async def _should_log(self, guild: Optional[discord.Guild], event: str) -> bool:
+        """Cheap pre-check (enabled + event toggle) so listeners can skip
+        expensive audit-log fetches early."""
+        if guild is None:
+            return False
+        conf = self.config.guild(guild)
+        if not await conf.enabled():
+            return False
+        events = await conf.events()
+        return bool(events.get(event, False))
+
     # ------------------------------------------------------------------ #
     # Listeners: members
     # ------------------------------------------------------------------ #
@@ -215,6 +226,8 @@ class EventLog(commands.Cog):
     async def on_member_remove(self, member: discord.Member) -> None:
         guild = member.guild
         if await self._ignore_bot(guild, member):
+            return
+        if not await self._should_log(guild, "leaves"):
             return
         lang = await self.config.guild(guild).language()
         # Audit-log check: was this actually a kick?
@@ -237,6 +250,8 @@ class EventLog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_ban(self, guild: discord.Guild, user: discord.abc.User) -> None:
+        if not await self._should_log(guild, "bans"):
+            return
         lang = await self.config.guild(guild).language()
         entry = await self._audit_entry(guild, discord.AuditLogAction.ban, target_id=user.id)
         actor = entry.user if entry else None
@@ -256,6 +271,8 @@ class EventLog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_unban(self, guild: discord.Guild, user: discord.abc.User) -> None:
+        if not await self._should_log(guild, "bans"):
+            return
         lang = await self.config.guild(guild).language()
         entry = await self._audit_entry(guild, discord.AuditLogAction.unban, target_id=user.id)
         actor = entry.user if entry else None
@@ -301,7 +318,7 @@ class EventLog(commands.Cog):
     async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
         guild = after.guild
         lang = await self.config.guild(guild).language()
-        if before.nick != after.nick:
+        if before.nick != after.nick and await self._should_log(guild, "nicknames"):
             entry = await self._audit_entry(guild, discord.AuditLogAction.member_update, target_id=after.id)
             actor = entry.user if entry and entry.user and entry.user.id != after.id else None
             e = discord.Embed(colour=discord.Colour.blurple(), timestamp=discord.utils.utcnow())
@@ -319,7 +336,7 @@ class EventLog(commands.Cog):
                 parts.append("➕ " + ", ".join(r.mention for r in added))
             if removed:
                 parts.append("➖ " + ", ".join(r.mention for r in removed))
-            if parts:
+            if parts and await self._should_log(guild, "roles"):
                 entry = await self._audit_entry(
                     guild, discord.AuditLogAction.member_role_update, target_id=after.id
                 )
@@ -353,6 +370,8 @@ class EventLog(commands.Cog):
     @commands.Cog.listener()
     async def on_guild_channel_create(self, channel: discord.abc.GuildChannel) -> None:
         guild = channel.guild
+        if not await self._should_log(guild, "channels"):
+            return
         lang = await self.config.guild(guild).language()
         entry = await self._audit_entry(guild, discord.AuditLogAction.channel_create, target_id=channel.id)
         actor = entry.user if entry else None
@@ -368,6 +387,8 @@ class EventLog(commands.Cog):
     @commands.Cog.listener()
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
         guild = channel.guild
+        if not await self._should_log(guild, "channels"):
+            return
         lang = await self.config.guild(guild).language()
         # BUGFIX: resolve WHICH moderator deleted the channel via the audit log.
         entry = await self._audit_entry(guild, discord.AuditLogAction.channel_delete, target_id=channel.id)
@@ -401,6 +422,8 @@ class EventLog(commands.Cog):
             changes.append(f"NSFW: `{getattr(before, 'nsfw', None)}` → `{getattr(after, 'nsfw', None)}`")
         if not changes:
             return  # ignore positional shifts / permission syncs
+        if not await self._should_log(guild, "channels"):
+            return
         lang = await self.config.guild(guild).language()
         entry = await self._audit_entry(guild, discord.AuditLogAction.channel_update, target_id=after.id)
         actor = entry.user if entry else None
@@ -432,6 +455,8 @@ class EventLog(commands.Cog):
     @commands.Cog.listener()
     async def on_thread_delete(self, thread: discord.Thread) -> None:
         guild = thread.guild
+        if not await self._should_log(guild, "threads"):
+            return
         lang = await self.config.guild(guild).language()
         entry = await self._audit_entry(guild, discord.AuditLogAction.thread_delete, target_id=thread.id)
         actor = entry.user if entry else None

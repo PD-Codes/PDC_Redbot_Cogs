@@ -10,6 +10,7 @@ top-starred page) via the resilient drop-in.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import List, Optional
 
@@ -40,6 +41,7 @@ from .pdc_dashboard import (
 log = logging.getLogger("red.pdc.starboard")  # module logger
 
 DELETED_USER = 0xDE1  # sentinel for anonymized author IDs
+STAR_DEBOUNCE_SECONDS = 2.0  # coalesce reaction bursts per message
 
 
 class Starboard(commands.Cog):
@@ -62,12 +64,17 @@ class Starboard(commands.Cog):
             # message ID (str) -> {star_message, channel, author, count}
             entries={},
         )
+        # Debounce tasks per message: message_id -> asyncio.Task
+        self._star_tasks: dict = {}
 
     async def cog_load(self) -> None:
         register_dashboard(self)
 
     def cog_unload(self) -> None:
         unregister_dashboard(self)
+        for task in list(self._star_tasks.values()):
+            task.cancel()
+        self._star_tasks.clear()
 
     # ------------------------------------------------------------------ #
     # Red data APIs
@@ -136,12 +143,19 @@ class Starboard(commands.Cog):
                      or str(getattr(reaction.emoji, "id", "")) in configured)
             ):
                 continue
+            if selfstar:
+                # Fast path: use the raw count instead of paginating all users
+                # (only the bot's own reaction is subtracted).
+                count = int(reaction.count or 0)
+                if getattr(reaction, "me", False):
+                    count -= 1
+                return max(0, count)
             count = 0
             try:
                 async for user in reaction.users():
                     if user.bot:
                         continue
-                    if not selfstar and user.id == message.author.id:
+                    if user.id == message.author.id:
                         continue
                     count += 1
             except discord.HTTPException:

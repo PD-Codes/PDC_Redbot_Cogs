@@ -1,3 +1,5 @@
+import datetime
+
 import discord
 from discord import app_commands
 from redbot.core import Config, commands
@@ -242,6 +244,27 @@ class EventMessages(commands.Cog):
         ]
         return suggestions[:25]
 
+    async def _check_manage_guild(self, interaction: discord.Interaction) -> bool:
+        """Runtime permission check for the configuration slash commands.
+
+        Returns True if the command may proceed. Otherwise sends an ephemeral
+        error message and returns False.
+        """
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return False
+        is_owner = await self.bot.is_owner(interaction.user)
+        member_perms = getattr(interaction.user, "guild_permissions", None)
+        if not is_owner and (member_perms is None or not member_perms.manage_guild):
+            await interaction.response.send_message(
+                "You need the **Manage Server** permission to use this command.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
 
     # ------------------------------------------------------------
     # Slash: Enabled
@@ -255,6 +278,8 @@ class EventMessages(commands.Cog):
             "en-US": "Enable or disable an event.",
         }},
     )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
     @app_commands.describe(
         event="Which event?",
         value="true/false"
@@ -267,10 +292,12 @@ class EventMessages(commands.Cog):
         value: bool                # <-- now required
     ):
         """Enable or disable event messages for this server."""
+        if not await self._check_manage_guild(interaction):
+            return
         await interaction.response.defer(ephemeral=True)
 
         guild = interaction.guild
-        lang = await self.config.guild(guild).language() if guild else "en-US"
+        lang = await self.config.guild(guild).language()
 
         # Validation
         if event not in EVENTS:
@@ -303,6 +330,8 @@ class EventMessages(commands.Cog):
             "en-US": "Sets the channel for an event.",
         }},
     )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
     @app_commands.describe(
         event="Which event?",
         channel="Channel for notifications"
@@ -315,8 +344,10 @@ class EventMessages(commands.Cog):
         channel: discord.TextChannel   # <-- required
     ):
         """Set the channel where event messages are posted."""
+        if not await self._check_manage_guild(interaction):
+            return
         await interaction.response.defer(ephemeral=True)
-        lang = await self.config.guild(interaction.guild).language() if interaction.guild else "en-US"
+        lang = await self.config.guild(interaction.guild).language()
 
         if event not in EVENTS:
             await interaction.followup.send(
@@ -349,10 +380,15 @@ class EventMessages(commands.Cog):
     )
     async def em_status(self, interaction: discord.Interaction):
         """Show the current event-message configuration."""
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
         await interaction.response.defer(ephemeral=True)
 
-        guild = interaction.guild
-        lang = await self.config.guild(guild).language() if guild else "en-US"
+        lang = await self.config.guild(guild).language()
         data = await self.config.guild(guild).events()
 
         msg = tr_lang(lang, "**Eventstatus:**\n\n", "**Event status:**\n\n")
@@ -386,7 +422,38 @@ class EventMessages(commands.Cog):
 
         channel = guild.get_channel(ch_id)
         if channel:
-            await channel.send(message)
+            # Templates contain user-controlled content; never ping anyone.
+            await channel.send(
+                message, allowed_mentions=discord.AllowedMentions.none()
+            )
+
+    async def _find_audit_entry(
+        self,
+        guild: discord.Guild,
+        action: discord.AuditLogAction,
+        target_id: int,
+        limit: int = 5,
+    ) -> Optional[discord.AuditLogEntry]:
+        """Safely look up a recent audit log entry for the given action/target.
+
+        Returns None if the bot lacks permission, the request fails, or no
+        matching entry within the last 60 seconds is found.
+        """
+        me = guild.me
+        if me is None or not me.guild_permissions.view_audit_log:
+            return None
+        cutoff = discord.utils.utcnow() - datetime.timedelta(seconds=60)
+        try:
+            async for log in guild.audit_logs(limit=limit, action=action):
+                if (
+                    log.target is not None
+                    and getattr(log.target, "id", None) == target_id
+                    and log.created_at > cutoff
+                ):
+                    return log
+        except (discord.Forbidden, discord.HTTPException):
+            return None
+        return None
 
     async def _render_template(self, guild: discord.Guild, event: str, **kwargs: str) -> str:
         templates = await self.config.guild(guild).templates()
@@ -419,12 +486,9 @@ class EventMessages(commands.Cog):
         guild = member.guild
 
         # Check audit log: was the user kicked?
-        entry = None
-        async for log in guild.audit_logs(limit=5, action=discord.AuditLogAction.kick):
-            # Discord audit logs are slightly delayed, so we check 5 entries
-            if log.target.id == member.id:
-                entry = log
-                break
+        entry = await self._find_audit_entry(
+            guild, discord.AuditLogAction.kick, member.id, limit=5
+        )
 
         if entry:
             # → This was a kick
@@ -457,9 +521,9 @@ class EventMessages(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_ban(self, guild, user):
-        entry = None
-        async for log in guild.audit_logs(limit=1, action=discord.AuditLogAction.ban):
-            entry = log
+        entry = await self._find_audit_entry(
+            guild, discord.AuditLogAction.ban, user.id, limit=5
+        )
 
         reason = entry.reason or "Kein Grund angegeben" if entry else "Unbekannt"
         moderator = entry.user.mention if entry else "Unbekannt"
@@ -479,9 +543,9 @@ class EventMessages(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_unban(self, guild, user):
-        entry = None
-        async for log in guild.audit_logs(limit=1, action=discord.AuditLogAction.unban):
-            entry = log
+        entry = await self._find_audit_entry(
+            guild, discord.AuditLogAction.unban, user.id, limit=5
+        )
 
         moderator = entry.user.mention if entry else "Unbekannt"
 
@@ -518,9 +582,12 @@ class EventMessages(commands.Cog):
             # Timeout START
             if after.timed_out_until:
                 # Fetch audit log
-                entry = None
-                async for log in after.guild.audit_logs(limit=1, action=discord.AuditLogAction.member_update):
-                    entry = log
+                entry = await self._find_audit_entry(
+                    after.guild,
+                    discord.AuditLogAction.member_update,
+                    after.id,
+                    limit=5,
+                )
 
                 moderator = entry.user.mention if entry else "Unbekannt"
                 reason = entry.reason or "Kein Grund angegeben" if entry else "Unbekannt"

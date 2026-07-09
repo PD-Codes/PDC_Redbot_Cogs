@@ -343,6 +343,37 @@ class AutoModPlus(commands.Cog):
         except Exception:
             return False
 
+    async def _regex_match_any(self, patterns: List[str], content: str) -> Optional[int]:
+        """Check all patterns in a SINGLE worker thread with one overall time
+        budget. Returns the index of the first matching pattern, or None."""
+        compiled: List[Tuple[int, re.Pattern]] = []
+        for idx, pattern in enumerate(patterns):
+            if not pattern:
+                continue
+            rx = self._compile_pattern(pattern)
+            if rx is not None:
+                compiled.append((idx, rx))
+        if not compiled:
+            return None
+        text = content[:MAX_CONTENT_SCAN]
+
+        def _scan() -> Optional[int]:
+            for idx, rx in compiled:
+                try:
+                    if rx.search(text):
+                        return idx
+                except Exception:
+                    continue
+            return None
+
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(_scan), timeout=REGEX_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.warning("Regex filters timed out (message skipped)")
+            return None
+        except Exception:
+            return None
+
     # ------------------------------------------------------------------ #
     # Message processing
     # ------------------------------------------------------------------ #
@@ -472,20 +503,19 @@ class AutoModPlus(commands.Cog):
                 if ratio * 100 >= max(1, int(rule.get("ratio") or 80)):
                     return await trigger("caps", rule, f"{int(ratio * 100)}% caps")
 
-        # ---- regex word filter ---- #
+        # ---- regex word filter (all patterns in one worker thread) ---- #
         if content and regex_filters:
-            for entry in regex_filters:
-                pattern = str(entry.get("pattern") or "")
-                if not pattern:
-                    continue
-                if await self._regex_matches(pattern, content):
-                    label = tr_lang(data["language"], "Regex-Filter", "Regex filter")
-                    return await self._execute_action(
-                        message, member, "regex", label,
-                        str(entry.get("action") or "delete"),
-                        int(entry.get("timeout_minutes") or 10),
-                        f"pattern #{regex_filters.index(entry) + 1}",
-                    )
+            patterns = [str(e.get("pattern") or "") for e in regex_filters]
+            hit_idx = await self._regex_match_any(patterns, content)
+            if hit_idx is not None:
+                entry = regex_filters[hit_idx]
+                label = tr_lang(data["language"], "Regex-Filter", "Regex filter")
+                return await self._execute_action(
+                    message, member, "regex", label,
+                    str(entry.get("action") or "delete"),
+                    int(entry.get("timeout_minutes") or 10),
+                    f"pattern #{hit_idx + 1}",
+                )
 
     # ------------------------------------------------------------------ #
     # Anti-raid: join surge detection
@@ -562,6 +592,11 @@ class AutoModPlus(commands.Cog):
     async def _enable_lockdown(self, guild: discord.Guild, minutes: int) -> bool:
         if guild.id in self._lockdowns:
             return False
+        # Reserve the slot BEFORE the channel loop so a concurrent call cannot
+        # start a second lockdown and clobber the saved overwrites.
+        state: dict = {"overwrites": {}, "task": None}
+        self._lockdowns[guild.id] = state
+
         ar = {**DEFAULT_ANTIRAID, **(await self.config.guild(guild).antiraid())}
         ids = ar.get("lockdown_channels") or []
         channels: List[discord.TextChannel] = []
@@ -571,7 +606,7 @@ class AutoModPlus(commands.Cog):
             channels = list(guild.text_channels)
         channels = channels[:MAX_LOCKDOWN_CHANNELS]
 
-        prior: Dict[int, Optional[bool]] = {}
+        prior: Dict[int, Optional[bool]] = state["overwrites"]
         role = guild.default_role
         for ch in channels:
             try:
@@ -580,8 +615,10 @@ class AutoModPlus(commands.Cog):
                 ow.send_messages = False
                 await ch.set_permissions(role, overwrite=ow, reason="AutoModPlus lockdown")
             except (discord.Forbidden, discord.HTTPException):
+                prior.pop(ch.id, None)
                 continue
         if not prior:
+            self._lockdowns.pop(guild.id, None)
             return False
 
         async def _auto_unlock() -> None:
@@ -593,7 +630,7 @@ class AutoModPlus(commands.Cog):
             except Exception:
                 log.exception("Auto-unlock failed for guild %s", guild.id)
 
-        self._lockdowns[guild.id] = {"overwrites": prior, "task": asyncio.create_task(_auto_unlock())}
+        state["task"] = asyncio.create_task(_auto_unlock())
         lang = await self._lang(guild)
         await self._log_action(
             guild, tr_lang(lang, "Anti-Raid", "Anti-raid"), "lockdown", None,

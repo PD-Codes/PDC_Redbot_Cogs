@@ -11,11 +11,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html as html_mod
+import ipaddress
 import logging
 import re
+import socket
 import time
 import uuid
 from typing import List, Optional
+from urllib.parse import urlparse
 
 import discord
 from discord import app_commands
@@ -105,9 +108,53 @@ class SocialFeed(commands.Cog):
     def _entry_hash(cls, entry) -> str:
         return hashlib.sha1(cls._entry_key(entry).encode("utf-8", "replace")).hexdigest()
 
+    @staticmethod
+    def _resolve_and_check_host(host: str, port: int) -> bool:
+        """Blocking helper: resolve a host and verify all IPs are public."""
+        try:
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except (socket.gaierror, OSError):
+            return False
+        if not infos:
+            return False
+        for info in infos:
+            try:
+                ip = ipaddress.ip_address(info[4][0])
+            except ValueError:
+                return False
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_reserved
+                or ip.is_multicast
+                or ip.is_unspecified
+            ):
+                return False
+        return True
+
+    async def _is_safe_url(self, url: str) -> bool:
+        """Validate a feed URL against SSRF (scheme + resolved IP ranges)."""
+        try:
+            parsed = urlparse(str(url or "").strip())
+        except ValueError:
+            return False
+        scheme = (parsed.scheme or "").lower()
+        if scheme not in ("http", "https"):
+            return False
+        host = parsed.hostname
+        if not host:
+            return False
+        port = parsed.port or (443 if scheme == "https" else 80)
+        return await asyncio.to_thread(self._resolve_and_check_host, host, port)
+
     async def _parse(self, url: str):
         """Parse a feed URL off-thread. Returns the parsed feed or None."""
         if feedparser is None:
+            return None
+        # Re-validate before every fetch (DNS may have changed since add).
+        if not await self._is_safe_url(url):
+            log.warning("SocialFeed: blocked unsafe feed URL %s", url)
             return None
         try:
             return await asyncio.wait_for(
@@ -192,16 +239,28 @@ class SocialFeed(commands.Cog):
             guild = self.bot.get_guild(gid)
             if guild is None:
                 continue
-            updated = dict(feeds)
-            dirty = False
+            # Poll (network I/O) outside of any config lock, then merge the
+            # results per feed ID so concurrent edits/removals are not lost.
+            polled: dict = {}
             for fid, feed in feeds.items():
                 interval = max(MIN_POLL_INTERVAL, int(feed.get("interval") or DEFAULT_POLL_INTERVAL))
                 if now - float(feed.get("last_fetch") or 0) < interval:
                     continue
-                updated[fid] = await self._poll_feed(guild, dict(feed))
-                dirty = True
-            if dirty:
-                await self.config.guild(guild).feeds.set(updated)
+                polled[fid] = await self._poll_feed(guild, dict(feed))
+            if polled:
+                async with self.config.guild(guild).feeds() as current:
+                    for fid, result in polled.items():
+                        existing = current.get(fid)
+                        if existing is None:
+                            continue  # feed removed meanwhile
+                        if existing.get("url") != result.get("url"):
+                            continue  # URL edited meanwhile; poll state is stale
+                        # Only merge poll-state keys; keep user-editable fields.
+                        for key in ("last_fetch", "last_status", "last_error",
+                                    "error_count", "entry_count", "seen", "last"):
+                            if key in result:
+                                existing[key] = result[key]
+                        current[fid] = existing
 
     async def _poll_feed(self, guild: discord.Guild, feed: dict) -> dict:
         """Poll a single feed, post new entries, return the updated feed dict."""
@@ -282,6 +341,13 @@ class SocialFeed(commands.Cog):
         url = url.strip()
         if not url.lower().startswith(("http://", "https://")):
             await ctx.send(self._t(lang, "Die Feed-URL muss mit http(s):// beginnen.", "The feed URL must start with http(s)://."))
+            return
+        if not await self._is_safe_url(url):
+            await ctx.send(self._t(
+                lang,
+                "Diese URL ist nicht erlaubt (nicht auflösbar oder zeigt auf ein internes Netzwerk).",
+                "This URL is not allowed (unresolvable or pointing to an internal network).",
+            ))
             return
         await ctx.typing()
         parsed = await self._parse(url)
@@ -504,6 +570,12 @@ class SocialFeed(commands.Cog):
         url = str(data.get("url") or "").strip()
         if url and not url.lower().startswith(("http://", "https://")):
             return SubmitResult.fail(tr_lang(lang, "URL muss mit http(s):// beginnen.", "URL must start with http(s)://."))
+        if url and not await self._is_safe_url(url):
+            return SubmitResult.fail(tr_lang(
+                lang,
+                "Diese URL ist nicht erlaubt (nicht auflösbar oder internes Netzwerk).",
+                "This URL is not allowed (unresolvable or internal network).",
+            ))
         try:
             interval = int(data.get("interval") or DEFAULT_POLL_INTERVAL)
         except (TypeError, ValueError):
@@ -554,6 +626,12 @@ class SocialFeed(commands.Cog):
             return SubmitResult.fail(tr_lang(lang, "URL und Kanal erforderlich.", "URL and channel required."))
         if not url.lower().startswith(("http://", "https://")):
             return SubmitResult.fail(tr_lang(lang, "URL muss mit http(s):// beginnen.", "URL must start with http(s)://."))
+        if not await self._is_safe_url(url):
+            return SubmitResult.fail(tr_lang(
+                lang,
+                "Diese URL ist nicht erlaubt (nicht auflösbar oder internes Netzwerk).",
+                "This URL is not allowed (unresolvable or internal network).",
+            ))
         try:
             interval = int(data.get("interval") or DEFAULT_POLL_INTERVAL)
         except (TypeError, ValueError):

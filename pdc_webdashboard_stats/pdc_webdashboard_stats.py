@@ -96,6 +96,12 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
         self._msg_buf: Dict[Tuple[int, str], Dict[str, Any]] = {}
         # Command usage: {(guild_id, daykey): {"cmds": {name: n}, "errs": {name: n}}}
         self._cmd_buf: Dict[Tuple[int, str], Dict[str, Any]] = {}
+        # Voice minutes, buffered like messages and written in the flush cycle:
+        # {(guild_id, daykey): {"minutes": float, "channels": {cid: min},
+        #                       "members": {mid: min}, "hours": {hr: min}}}
+        self._voice_buf: Dict[Tuple[int, str], Dict[str, Any]] = {}
+        # Last prune day per guild (prune only once per day).
+        self._last_prune: Dict[int, str] = {}
         self._enabled_cache: Dict[int, bool] = {}
         # Cached copies of the global settings (loaded in cog_load).
         self._retention_days: int = RETENTION_DAYS
@@ -228,8 +234,8 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
             pass
 
     async def _flush(self) -> None:
-        """Writes buffered message and command counters to the config in a batch."""
-        if not self._msg_buf and not self._cmd_buf:
+        """Writes buffered message, command and voice counters to the config in a batch."""
+        if not self._msg_buf and not self._cmd_buf and not self._voice_buf:
             return
         buf = self._msg_buf
         self._msg_buf = {}
@@ -298,11 +304,47 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
                 except Exception:
                     log.debug("cmd flush failed for guild %s", gid, exc_info=True)
 
+        # Batch voice minutes (buffered by the voice listeners/tick).
+        if self._voice_buf:
+            vbuf = self._voice_buf
+            self._voice_buf = {}
+            by_gv: Dict[int, list] = {}
+            for (gid, dk), e in vbuf.items():
+                by_gv.setdefault(gid, []).append((dk, e))
+            for gid, entries in by_gv.items():
+                guild = self.bot.get_guild(gid)
+                if guild is None:
+                    continue
+                try:
+                    async with self.config.guild(guild).days() as days:
+                        for dk, e in entries:
+                            d = days.get(dk) if isinstance(days.get(dk), dict) else {}
+                            d["voice_minutes"] = d.get("voice_minutes", 0) + e["minutes"]
+                            days[dk] = d
+                    async with self.config.guild(guild).voice_channels() as vc:
+                        for dk, e in entries:
+                            day = vc.get(dk) if isinstance(vc.get(dk), dict) else {}
+                            for cid, n in e["channels"].items():
+                                day[cid] = day.get(cid, 0) + n
+                            vc[dk] = day
+                    async with self.config.guild(guild).voice_members() as vm:
+                        for dk, e in entries:
+                            day = vm.get(dk) if isinstance(vm.get(dk), dict) else {}
+                            for mid, n in e["members"].items():
+                                day[mid] = day.get(mid, 0) + n
+                            vm[dk] = day
+                    async with self.config.guild(guild).voice_hourly() as vh:
+                        for dk, e in entries:
+                            day = vh.get(dk) if isinstance(vh.get(dk), dict) else {}
+                            for hr, n in e["hours"].items():
+                                day[hr] = day.get(hr, 0) + n
+                            vh[dk] = day
+                except Exception:
+                    log.debug("voice flush failed for guild %s", gid, exc_info=True)
+
     async def _final_flush(self) -> None:
-        try:
-            await self._flush()
-        except Exception:
-            pass
+        # End open voice sessions first (they credit into the voice buffer),
+        # then write all buffers out in one final flush.
         for key in list(self._voice.keys()):
             gid, mid = key
             guild = self.bot.get_guild(gid)
@@ -311,6 +353,10 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
                     await self._end_voice_session(guild, mid, key)
                 except Exception:
                     pass
+        try:
+            await self._flush()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # Listener: members
@@ -364,6 +410,20 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
         except Exception:
             log.debug("voice stats failed", exc_info=True)
 
+    def _voice_bump(self, guild_id: int, ch_id: int, member_id: int, minutes: float, hour: int) -> None:
+        """Credit voice minutes to the in-memory buffer (flushed periodically)."""
+        entry = self._voice_buf.setdefault(
+            (guild_id, _daykey()),
+            {"minutes": 0.0, "channels": {}, "members": {}, "hours": {}},
+        )
+        entry["minutes"] += minutes
+        cid = str(ch_id)
+        entry["channels"][cid] = entry["channels"].get(cid, 0) + minutes
+        mid = str(member_id)
+        entry["members"][mid] = entry["members"].get(mid, 0) + minutes
+        hr = str(hour)
+        entry["hours"][hr] = entry["hours"].get(hr, 0) + minutes
+
     async def _end_voice_session(self, guild: discord.Guild, member_id: int, key) -> None:
         ch_id, start = self._voice.pop(key, (None, None))
         if ch_id is None or start is None:
@@ -371,10 +431,7 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
         minutes = max(0.0, (_utcnow() - start).total_seconds() / 60.0)
         if minutes <= 0:
             return
-        await self._bump_day(guild, "voice_minutes", minutes)
-        await self._bump_nested(guild, "voice_channels", str(ch_id), minutes)
-        await self._bump_nested(guild, "voice_members", str(member_id), minutes)
-        await self._bump_nested(guild, "voice_hourly", str(_utcnow().hour), minutes)
+        self._voice_bump(guild.id, ch_id, member_id, minutes, _utcnow().hour)
 
     # ------------------------------------------------------------------ #
     # Listener: invites
@@ -499,7 +556,12 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
                     "playing": defaultdict(int), "streaming": defaultdict(int),
                     "listening": defaultdict(int), "watching": defaultdict(int),
                 }
+                processed = 0
                 for m in guild.members:
+                    processed += 1
+                    if processed % 200 == 0:
+                        # Yield to the event loop on large guilds.
+                        await asyncio.sleep(0)
                     if m.bot:
                         continue
                     st = getattr(m, "status", discord.Status.offline)
@@ -562,7 +624,10 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
                         for nm, count in kinds["playing"].items():
                             day[nm] = day.get(nm, 0) + count * self._sample_minutes
                         act_store[key] = day
-                await self._prune(guild)
+                # Prune only once per day per guild instead of on every snapshot.
+                if self._last_prune.get(guild.id) != key:
+                    await self._prune(guild)
+                    self._last_prune[guild.id] = key
             except Exception:
                 log.debug("snapshot failed for guild %s", guild.id, exc_info=True)
 
@@ -592,14 +657,16 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
 
     @tasks.loop(seconds=60)
     async def _flush_loop(self) -> None:
-        try:
-            await self._flush()
-        except Exception:
-            log.debug("flush loop failed", exc_info=True)
+        # Credit open voice sessions into the buffer first, then write all
+        # buffers (messages, commands, voice) in one batch.
         try:
             await self._flush_voice()
         except Exception:
             log.debug("voice tick failed", exc_info=True)
+        try:
+            await self._flush()
+        except Exception:
+            log.debug("flush loop failed", exc_info=True)
 
     async def _flush_voice(self) -> None:
         """Credit the elapsed time of OPEN voice sessions incrementally and advance
@@ -623,10 +690,8 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
             # Advance the session start first so we never double-count this slice.
             self._voice[key] = (ch_id, now)
             try:
-                await self._bump_day(guild, "voice_minutes", minutes)
-                await self._bump_nested(guild, "voice_channels", str(ch_id), minutes)
-                await self._bump_nested(guild, "voice_members", str(mid), minutes)
-                await self._bump_nested(guild, "voice_hourly", str(now.hour), minutes)
+                # Buffer only; the actual config write happens in _flush().
+                self._voice_bump(gid, ch_id, mid, minutes, now.hour)
             except Exception:
                 log.debug("voice tick failed for %s", key, exc_info=True)
 

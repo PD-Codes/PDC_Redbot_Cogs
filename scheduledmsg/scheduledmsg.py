@@ -261,11 +261,20 @@ class ScheduledMsg(commands.Cog):
             tz = _tzinfo(gconf.get("timezone"))
             catchup = str(gconf.get("catchup") or "skip")
             lang = str(gconf.get("language") or "en-US")
+            # Sends (network I/O) happen outside of any config lock; the
+            # results are merged per job afterwards so concurrent edits from
+            # commands/dashboard are not lost.
+            def _job_key(j: dict) -> str:
+                jid = str(j.get("id") or "")
+                if jid:
+                    return jid
+                return f"{j.get('channel')}|{j.get('spec')}|{j.get('content')}"
+
             changed = False
-            remaining: List[dict] = []
+            updates: dict = {}  # key -> {"spec", "last_run"?, "next_run"?}
+            drops: set = set()
             for job in jobs:
                 if job.get("next_run", 0) > now_ts:
-                    remaining.append(job)
                     continue
                 # Due. Decide whether to send: on-time jobs always fire; jobs
                 # missed while the bot was down follow the catch-up policy
@@ -279,17 +288,35 @@ class ScheduledMsg(commands.Cog):
                             await ch.send(self._render(job.get("content", ""), guild, ch, tz, lang))
                         except discord.HTTPException:
                             pass
-                    job["last_run"] = now_ts
                 changed = True
-                if str(job.get("spec", "")).strip().lower().startswith("once"):
-                    continue  # drop one-time jobs after their (possibly skipped) slot
-                nxt = compute_next(job.get("spec", ""), now_utc, tz)
+                key = _job_key(job)
+                spec = str(job.get("spec", ""))
+                if spec.strip().lower().startswith("once"):
+                    drops.add(key)  # drop one-time jobs after their slot
+                    continue
+                nxt = compute_next(spec, now_utc, tz)
                 if nxt is None:
-                    continue  # invalid -> drop
-                job["next_run"] = nxt.timestamp()
-                remaining.append(job)
+                    drops.add(key)  # invalid -> drop
+                    continue
+                upd = {"spec": spec, "next_run": nxt.timestamp()}
+                if should_send:
+                    upd["last_run"] = now_ts
+                updates[key] = upd
             if changed:
-                await self.config.guild(guild).jobs.set(remaining)
+                async with self.config.guild(guild).jobs() as current:
+                    merged: List[dict] = []
+                    for job in current:
+                        key = _job_key(job)
+                        if key in drops:
+                            continue
+                        upd = updates.get(key)
+                        # Only apply if the spec was not edited concurrently.
+                        if upd is not None and str(job.get("spec", "")) == upd["spec"]:
+                            job["next_run"] = upd["next_run"]
+                            if "last_run" in upd:
+                                job["last_run"] = upd["last_run"]
+                        merged.append(job)
+                    current[:] = merged
 
     # ------------------------------------------------------------------ #
     # Commands (core management: moderators and up)

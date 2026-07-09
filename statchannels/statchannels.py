@@ -168,7 +168,14 @@ class StatChannels(commands.Cog):
             if not ch.permissions_for(guild.me).manage_channels:
                 continue
             try:
-                await ch.edit(name=new_name, reason="StatChannels update")
+                # discord.py silently queues renames hit by the 2/10min bucket;
+                # a timeout keeps one stuck channel from blocking the loop.
+                await asyncio.wait_for(
+                    ch.edit(name=new_name, reason="StatChannels update"), timeout=10
+                )
+            except asyncio.TimeoutError:
+                self._backoff_until[ch.id] = time.time() + RATELIMIT_BACKOFF
+                log.warning("StatChannels: renaming %s timed out — backing off %ss", ch.id, RATELIMIT_BACKOFF)
             except discord.HTTPException as exc:
                 if getattr(exc, "status", None) == 429:
                     self._backoff_until[ch.id] = time.time() + RATELIMIT_BACKOFF
@@ -217,10 +224,21 @@ class StatChannels(commands.Cog):
             self._t(lang, f"Hinzugefügt: {channel.mention} → `{template}`", f"Added: {channel.mention} → `{template}`")
         )
         # Update immediately (best effort; rename may be rate limited).
+        # A timeout keeps the command/interaction from hanging when discord.py
+        # queues the rename behind the 2/10min bucket.
         new_name = self._render(template, self._stats(ctx.guild))
         if channel.name != new_name:
             try:
-                await channel.edit(name=new_name, reason="StatChannels")
+                await asyncio.wait_for(
+                    channel.edit(name=new_name, reason="StatChannels"), timeout=10
+                )
+            except asyncio.TimeoutError:
+                self._backoff_until[channel.id] = time.time() + RATELIMIT_BACKOFF
+                await ctx.send(self._t(
+                    lang,
+                    "Discord bremst Umbenennungen gerade — der Name wird beim nächsten Durchlauf gesetzt.",
+                    "Discord is rate limiting renames — the name will be applied on the next cycle.",
+                ))
             except discord.HTTPException as exc:
                 if getattr(exc, "status", None) == 429:
                     self._backoff_until[channel.id] = time.time() + RATELIMIT_BACKOFF

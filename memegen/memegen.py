@@ -347,8 +347,10 @@ class MemeGen(commands.Cog):
             await self.config.guild(guild).last_post.set(now)
             if js:
                 embed, file = await self._build_post(js)
+                # Only pass "file" when we actually have one (file=None raises).
+                send_kwargs = {"file": file} if file is not None else {}
                 try:
-                    await channel.send(embed=embed, file=file)
+                    await channel.send(embed=embed, **send_kwargs)
                 except discord.HTTPException:
                     pass
 
@@ -379,7 +381,9 @@ class MemeGen(commands.Cog):
             await ctx.send(embed=self._error_embed(lang))
             return
         embed, file = await self._build_post(js)
-        await ctx.send(embed=embed, file=file)
+        # Only pass "file" when we actually have one (file=None raises).
+        send_kwargs = {"file": file} if file is not None else {}
+        await ctx.send(embed=embed, **send_kwargs)
 
     @commands.hybrid_group(name="memeset")
     @commands.admin_or_permissions(manage_guild=True)
