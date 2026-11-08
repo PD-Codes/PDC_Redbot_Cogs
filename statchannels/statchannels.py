@@ -48,6 +48,32 @@ _TOKEN_RE = re.compile(r"\{([a-zA-Z_]+)\}")
 MIN_INTERVAL = 600  # seconds (Discord rename rate limits: ~2 per 10 min per channel)
 RENAME_SPACING = 2.0  # seconds between individual channel renames
 RATELIMIT_BACKOFF = 900  # seconds to skip a channel after a 429
+RENAME_LIMIT = 2  # renames allowed per channel ...
+RENAME_WINDOW = 600  # ... within this many seconds (Discord's bucket)
+
+_WS_RE = re.compile(r"\s+")
+
+
+def normalize_channel_name(name: str, text_like: bool) -> str:
+    """Approximate Discord's name normalization for comparisons.
+
+    Text-like channels (text/news/forum) are stored lowercase with whitespace
+    replaced by dashes; voice/stage/category names are kept as typed.
+    """
+    value = str(name or "").strip()[:100]
+    if text_like:
+        value = _WS_RE.sub("-", value.lower())
+    return value
+
+
+def rename_allowed(history: List[float], now: float, limit: int = RENAME_LIMIT,
+                   window: float = RENAME_WINDOW) -> bool:
+    """True if fewer than ``limit`` renames happened within ``window`` seconds."""
+    return sum(1 for ts in history if now - ts < window) < limit
+
+
+def _is_text_like(channel) -> bool:
+    return isinstance(channel, (discord.TextChannel, discord.ForumChannel))
 
 
 class StatChannels(commands.Cog):
@@ -66,6 +92,8 @@ class StatChannels(commands.Cog):
         self._tick_lock = asyncio.Lock()  # parallel-safe (startup/reload)
         self._last_run: Dict[int, float] = {}  # guild_id -> last refresh ts
         self._backoff_until: Dict[int, float] = {}  # channel_id -> skip-until ts
+        # channel_id -> timestamps of our recent renames (global rename budget)
+        self._rename_history: Dict[int, List[float]] = {}
 
     async def cog_load(self) -> None:
         register_dashboard(self)
@@ -149,8 +177,39 @@ class StatChannels(commands.Cog):
             guild = self.bot.get_guild(gid)
             if guild is None:
                 continue
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                continue
             self._last_run[gid] = now
             await self._refresh_guild(guild, channels)
+
+    def _same_name(self, channel, new_name: str) -> bool:
+        text_like = _is_text_like(channel)
+        return normalize_channel_name(channel.name, text_like) == normalize_channel_name(new_name, text_like)
+
+    async def _rename(self, channel, new_name: str, reason: str) -> str:
+        """Rename within the per-channel budget. Returns ok/skipped/ratelimited/error."""
+        now = time.time()
+        history = [ts for ts in self._rename_history.get(channel.id, []) if now - ts < RENAME_WINDOW]
+        self._rename_history[channel.id] = history
+        if now < self._backoff_until.get(channel.id, 0.0) or not rename_allowed(history, now):
+            return "skipped"
+        history.append(now)  # count attempts too: Discord counts them against the bucket
+        try:
+            # discord.py silently queues renames hit by the 2/10min bucket;
+            # a timeout keeps one stuck channel from blocking the caller.
+            await asyncio.wait_for(channel.edit(name=new_name, reason=reason), timeout=10)
+            return "ok"
+        except asyncio.TimeoutError:
+            self._backoff_until[channel.id] = time.time() + RATELIMIT_BACKOFF
+            log.warning("StatChannels: renaming %s timed out — backing off %ss", channel.id, RATELIMIT_BACKOFF)
+            return "ratelimited"
+        except discord.HTTPException as exc:
+            if getattr(exc, "status", None) == 429:
+                self._backoff_until[channel.id] = time.time() + RATELIMIT_BACKOFF
+                log.warning("StatChannels: rate limited renaming %s — backing off %ss", channel.id, RATELIMIT_BACKOFF)
+                return "ratelimited"
+            log.warning("StatChannels: renaming %s failed", channel.id, exc_info=True)
+            return "error"
 
     async def _refresh_guild(self, guild: discord.Guild, channels: dict) -> None:
         """Rename all stat channels of a guild, spread out and 429-aware."""
@@ -163,25 +222,12 @@ class StatChannels(commands.Cog):
             if now < self._backoff_until.get(ch.id, 0.0):
                 continue  # channel is rate limited — try again next cycle
             new_name = self._render(template, stats)
-            if ch.name == new_name:
+            if self._same_name(ch, new_name):
                 continue  # only rename when the rendered name actually changed
             if not ch.permissions_for(guild.me).manage_channels:
                 continue
-            try:
-                # discord.py silently queues renames hit by the 2/10min bucket;
-                # a timeout keeps one stuck channel from blocking the loop.
-                await asyncio.wait_for(
-                    ch.edit(name=new_name, reason="StatChannels update"), timeout=10
-                )
-            except asyncio.TimeoutError:
-                self._backoff_until[ch.id] = time.time() + RATELIMIT_BACKOFF
-                log.warning("StatChannels: renaming %s timed out — backing off %ss", ch.id, RATELIMIT_BACKOFF)
-            except discord.HTTPException as exc:
-                if getattr(exc, "status", None) == 429:
-                    self._backoff_until[ch.id] = time.time() + RATELIMIT_BACKOFF
-                    log.warning("StatChannels: rate limited renaming %s — backing off %ss", ch.id, RATELIMIT_BACKOFF)
-                else:
-                    log.warning("StatChannels: renaming %s failed", ch.id, exc_info=True)
+            if await self._rename(ch, new_name, "StatChannels update") == "skipped":
+                continue
             # Spread renames so many stat channels don't burst the API.
             await asyncio.sleep(RENAME_SPACING)
 
@@ -227,26 +273,15 @@ class StatChannels(commands.Cog):
         # A timeout keeps the command/interaction from hanging when discord.py
         # queues the rename behind the 2/10min bucket.
         new_name = self._render(template, self._stats(ctx.guild))
-        if channel.name != new_name:
-            try:
-                await asyncio.wait_for(
-                    channel.edit(name=new_name, reason="StatChannels"), timeout=10
-                )
-            except asyncio.TimeoutError:
-                self._backoff_until[channel.id] = time.time() + RATELIMIT_BACKOFF
+        if not self._same_name(channel, new_name):
+            # Shares the per-channel rename budget with the background loop.
+            result = await self._rename(channel, new_name, "StatChannels")
+            if result in ("skipped", "ratelimited"):
                 await ctx.send(self._t(
                     lang,
                     "Discord bremst Umbenennungen gerade — der Name wird beim nächsten Durchlauf gesetzt.",
                     "Discord is rate limiting renames — the name will be applied on the next cycle.",
                 ))
-            except discord.HTTPException as exc:
-                if getattr(exc, "status", None) == 429:
-                    self._backoff_until[channel.id] = time.time() + RATELIMIT_BACKOFF
-                    await ctx.send(self._t(
-                        lang,
-                        "Discord bremst Umbenennungen gerade — der Name wird beim nächsten Durchlauf gesetzt.",
-                        "Discord is rate limiting renames — the name will be applied on the next cycle.",
-                    ))
 
     @statchannels.command(name="remove")
     @app_commands.describe(channel="Channel to stop updating")

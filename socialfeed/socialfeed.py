@@ -18,8 +18,9 @@ import socket
 import time
 import uuid
 from typing import List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
+import aiohttp
 import discord
 from discord import app_commands
 from redbot.core import Config, commands
@@ -53,8 +54,63 @@ MIN_POLL_INTERVAL = 60  # seconds
 LOOP_STEP = 30  # scheduler resolution in seconds
 SEEN_CAP = 400  # persisted de-dup hashes per feed
 BURST_CAP = 5  # max entries posted per feed per tick
+FETCH_TIMEOUT = 15  # seconds for the whole HTTP fetch
+FETCH_MAX_BYTES = 5 * 1024 * 1024  # hard cap on the feed body size
+FETCH_MAX_REDIRECTS = 3
+_REDIRECT_CODES = (301, 302, 303, 307, 308)
 
 _TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _ip_allowed(value: str) -> bool:
+    """Return True if an IP address is publicly routable (SSRF guard)."""
+    try:
+        ip = ipaddress.ip_address(str(value).split("%", 1)[0])
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def merge_seen(seen: List[str], current_newest_first: List[str], cap: int = SEEN_CAP) -> List[str]:
+    """Merge de-dup hashes so the newest entries survive the cap.
+
+    The result is ordered oldest -> newest; hashes of entries still present in
+    the feed are moved to the end (newest first in the feed = last in the list),
+    so trimming from the front drops the oldest, no longer listed entries first.
+    """
+    current = list(dict.fromkeys(current_newest_first))
+    current_set = set(current)
+    merged = [h for h in seen if h not in current_set] + list(reversed(current))
+    return merged[-cap:] if cap > 0 else []
+
+
+class _PublicOnlyResolver(aiohttp.abc.AbstractResolver):
+    """Resolver that refuses hostnames resolving to non-public addresses.
+
+    Closes the DNS-rebinding gap between the pre-check and the actual connect.
+    """
+
+    def __init__(self) -> None:
+        self._inner = aiohttp.ThreadedResolver()
+
+    async def resolve(self, host, port=0, family=socket.AF_INET):  # type: ignore[override]
+        infos = await self._inner.resolve(host, port, family)
+        for info in infos:
+            if not _ip_allowed(info.get("host", "")):
+                raise OSError(f"blocked non-public address for {host}")
+        return infos
+
+    async def close(self) -> None:
+        await self._inner.close()
 
 
 def _clean_text(value: str, limit: int = 500) -> str:
@@ -117,21 +173,7 @@ class SocialFeed(commands.Cog):
             return False
         if not infos:
             return False
-        for info in infos:
-            try:
-                ip = ipaddress.ip_address(info[4][0])
-            except ValueError:
-                return False
-            if (
-                ip.is_private
-                or ip.is_loopback
-                or ip.is_link_local
-                or ip.is_reserved
-                or ip.is_multicast
-                or ip.is_unspecified
-            ):
-                return False
-        return True
+        return all(_ip_allowed(info[4][0]) for info in infos)
 
     async def _is_safe_url(self, url: str) -> bool:
         """Validate a feed URL against SSRF (scheme + resolved IP ranges)."""
@@ -148,17 +190,59 @@ class SocialFeed(commands.Cog):
         port = parsed.port or (443 if scheme == "https" else 80)
         return await asyncio.to_thread(self._resolve_and_check_host, host, port)
 
+    async def _fetch_bytes(self, url: str) -> Optional[bytes]:
+        """Fetch a feed body with SSRF checks on every redirect hop.
+
+        Redirects are followed manually (max FETCH_MAX_REDIRECTS); each target
+        is re-validated (scheme + DNS resolution of every IP). The body is
+        capped at FETCH_MAX_BYTES and the whole fetch at FETCH_TIMEOUT seconds.
+        """
+        current = str(url or "").strip()
+        timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT)
+        connector = aiohttp.TCPConnector(resolver=_PublicOnlyResolver())
+        headers = {"User-Agent": "Red-DiscordBot SocialFeed (+https://github.com/Domekologe)"}
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, connector=connector, headers=headers) as session:
+                for _hop in range(FETCH_MAX_REDIRECTS + 1):
+                    if not await self._is_safe_url(current):
+                        log.warning("SocialFeed: blocked unsafe feed URL %s", current)
+                        return None
+                    async with session.get(current, allow_redirects=False) as resp:
+                        if resp.status in _REDIRECT_CODES:
+                            location = resp.headers.get("Location")
+                            if not location:
+                                return None
+                            current = urljoin(current, location)
+                            continue
+                        if resp.status != 200:
+                            log.debug("SocialFeed: %s returned HTTP %s", current, resp.status)
+                            return None
+                        if resp.content_length is not None and resp.content_length > FETCH_MAX_BYTES:
+                            return None
+                        body = bytearray()
+                        async for chunk in resp.content.iter_chunked(65536):
+                            body.extend(chunk)
+                            if len(body) > FETCH_MAX_BYTES:
+                                log.warning("SocialFeed: feed %s exceeds size limit", url)
+                                return None
+                        return bytes(body)
+                log.warning("SocialFeed: too many redirects for %s", url)
+                return None
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError):
+            log.debug("feed fetch failed for %s", url, exc_info=True)
+            return None
+
     async def _parse(self, url: str):
-        """Parse a feed URL off-thread. Returns the parsed feed or None."""
+        """Fetch (SSRF-safe) and parse a feed. Returns the parsed feed or None."""
         if feedparser is None:
             return None
-        # Re-validate before every fetch (DNS may have changed since add).
-        if not await self._is_safe_url(url):
-            log.warning("SocialFeed: blocked unsafe feed URL %s", url)
+        body = await self._fetch_bytes(url)
+        if body is None:
             return None
         try:
+            # Parsing bytes performs no network I/O; run it off the event loop.
             return await asyncio.wait_for(
-                self.bot.loop.run_in_executor(None, feedparser.parse, url), timeout=30
+                self.bot.loop.run_in_executor(None, feedparser.parse, body), timeout=30
             )
         except Exception:
             log.debug("feed parse failed for %s", url, exc_info=True)
@@ -239,6 +323,8 @@ class SocialFeed(commands.Cog):
             guild = self.bot.get_guild(gid)
             if guild is None:
                 continue
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                continue
             # Poll (network I/O) outside of any config lock, then merge the
             # results per feed ID so concurrent edits/removals are not lost.
             polled: dict = {}
@@ -284,7 +370,7 @@ class SocialFeed(commands.Cog):
         new_items = []
         if not first_run:
             legacy_last = feed.get("last")
-            for e in entries:
+            for e in entries[:SEEN_CAP]:
                 key_hash = self._entry_hash(e)
                 if key_hash in seen_set:
                     continue
@@ -302,13 +388,9 @@ class SocialFeed(commands.Cog):
                 except discord.HTTPException:
                     log.warning("SocialFeed: sending entry to #%s failed", getattr(channel, "name", "?"), exc_info=True)
 
-        # Persist de-dup hashes (all current entries), capped.
-        for e in entries:
-            h = self._entry_hash(e)
-            if h not in seen_set:
-                seen.append(h)
-                seen_set.add(h)
-        feed["seen"] = seen[-SEEN_CAP:]
+        # Persist de-dup hashes (all current entries), capped: drop the oldest
+        # hashes first and always keep the newest ones.
+        feed["seen"] = merge_seen(seen, [self._entry_hash(e) for e in entries[:SEEN_CAP]])
         feed["last"] = self._entry_key(entries[0])  # keep legacy marker updated
         return feed
 

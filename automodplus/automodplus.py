@@ -24,7 +24,17 @@ from collections import deque
 from datetime import timedelta
 from typing import Deque, Dict, List, Optional, Tuple
 
+try:  # third-party engine: per-call timeout and GIL release (see info.json requirements)
+    import regex as _regex
+except ImportError:  # pragma: no cover - fallback when the requirement is missing
+    _regex = None
+try:  # Python 3.11+
+    import re._parser as _sre_parse
+except ImportError:  # Python <= 3.10
+    import sre_parse as _sre_parse
+
 import discord
+from discord import app_commands
 from redbot.core import Config, commands
 
 from .pdc_dashboard import (
@@ -36,7 +46,6 @@ from .pdc_dashboard import (
     dashboard_panel,
     dashboard_widget,
     register_dashboard,
-    tr,
     tr_lang,
     unregister_dashboard,
 )
@@ -96,7 +105,11 @@ _UNICODE_EMOJI_RE = re.compile(r"[\U0001F000-\U0001FAFF☀-➿️]")
 MAX_PATTERN_LENGTH = 200
 MAX_PATTERNS_PER_GUILD = 50
 REGEX_TIMEOUT = 0.1  # seconds per pattern per message
+REGEX_TOTAL_BUDGET = 0.5  # seconds for all patterns of one message
 MAX_CONTENT_SCAN = 2000  # only scan the first N characters
+MAX_REGEX_CACHE = 500
+# Quantified group whose alternatives overlap, e.g. (a|a)* or (ab|a)+ .
+_RISKY_ALT_RE = re.compile(r"\((?:\?:)?((?:[^()\\]|\\.)*\|(?:[^()\\]|\\.)*)\)\s*(?:[*+]|\{\d*,\d*\})")
 
 # How many channels a lockdown touches at most (rate-limit safety).
 MAX_LOCKDOWN_CHANNELS = 50
@@ -109,6 +122,124 @@ def _content_hash(text: str) -> str:
 
 def _count_emojis(text: str) -> int:
     return len(_CUSTOM_EMOJI_RE.findall(text)) + len(_UNICODE_EMOJI_RE.findall(text))
+
+
+def _split_alternatives(text: str) -> List[str]:
+    """Split a group body on unescaped `|`."""
+    parts, cur, esc = [], [], False
+    for ch in text:
+        if esc:
+            cur.append(ch)
+            esc = False
+        elif ch == "\\":
+            cur.append(ch)
+            esc = True
+        elif ch == "|":
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return parts
+
+
+def _first_chars(items) -> Optional[set]:
+    """Possible first characters of a parsed sequence; None means 'unknown/any'."""
+    for op, av in items:
+        name = str(op)
+        if name == "AT":
+            continue
+        if name == "LITERAL":
+            return {chr(av).lower()}
+        if name == "IN":
+            out: set = set()
+            for iop, iav in av:
+                iname = str(iop)
+                if iname == "LITERAL":
+                    out.add(chr(iav).lower())
+                elif iname == "RANGE" and iav[1] - iav[0] <= 256:
+                    out.update(chr(c).lower() for c in range(iav[0], iav[1] + 1))
+                else:
+                    return None
+            return out
+        if name == "SUBPATTERN":
+            return _first_chars(av[-1])
+        if name == "BRANCH":
+            out = set()
+            for alt in av[1]:
+                f = _first_chars(alt)
+                if f is None:
+                    return None
+                out |= f
+            return out
+        return None
+    return None  # empty sequence can match the empty string
+
+
+def _subpatterns(av):
+    if isinstance(av, _sre_parse.SubPattern):
+        yield av
+    elif isinstance(av, (list, tuple)):
+        for x in av:
+            yield from _subpatterns(x)
+
+
+def _pattern_risk(pattern: str) -> Optional[str]:
+    """Return a reason string when a pattern is prone to catastrophic
+    backtracking (nested quantifiers, overlapping alternation under a
+    quantifier, excessive length); None when it looks safe."""
+    if len(pattern) > MAX_PATTERN_LENGTH:
+        return "length"
+    for m in _RISKY_ALT_RE.finditer(pattern):
+        alts = _split_alternatives(m.group(1))
+        for i, a in enumerate(alts):
+            for b in alts[i + 1:]:
+                if not a or not b or a[0] == b[0] or a.startswith(b) or b.startswith(a):
+                    return "alternation"
+    try:
+        parsed = _sre_parse.parse(pattern)
+    except Exception:
+        return None  # syntax errors are reported by the compiler
+
+    def walk(items, in_repeat: bool) -> Optional[str]:
+        for op, av in items:
+            name = str(op)
+            if name in ("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT"):
+                _lo, hi, sub = av
+                unbounded = hi == _sre_parse.MAXREPEAT or hi > 16
+                if unbounded and in_repeat:
+                    return "nested"
+                r = walk(sub, in_repeat or unbounded)
+            elif name == "BRANCH":
+                if in_repeat:
+                    seen: set = set()
+                    for alt in av[1]:
+                        f = _first_chars(alt)
+                        if f is None or (seen & f):
+                            return "alternation"
+                        seen |= f
+                r = None
+                for alt in av[1]:
+                    r = r or walk(alt, in_repeat)
+            else:
+                r = None
+                for sp in _subpatterns(av):
+                    r = r or walk(sp, in_repeat)
+            if r:
+                return r
+        return None
+
+    try:
+        return walk(parsed, False)
+    except RecursionError:
+        return "nested"
+
+
+def _compile_user_regex(pattern: str):
+    """Compile a user-supplied filter pattern (case-insensitive)."""
+    if _regex is not None:
+        return _regex.compile(pattern, _regex.IGNORECASE | _regex.V0)
+    return re.compile(pattern, re.IGNORECASE)
 
 
 class AutoModPlus(commands.Cog):
@@ -125,6 +256,9 @@ class AutoModPlus(commands.Cog):
             # list of {"pattern": str, "action": str, "timeout_minutes": int}
             regex_filters=[],
             antiraid=DEFAULT_ANTIRAID,
+            # Persisted lockdown so a restart can still restore the channels:
+            # {"until": unix_ts, "overwrites": {channel_id(str): prior send_messages}}
+            lockdown_state=None,
         )
         # ---- transient in-memory state (never persisted) ---- #
         self._flood: Dict[Tuple[int, int], Deque[float]] = {}
@@ -142,16 +276,55 @@ class AutoModPlus(commands.Cog):
     # ------------------------------------------------------------------ #
     async def cog_load(self) -> None:
         register_dashboard(self)
+        self._restore_task = asyncio.create_task(self._restore_lockdowns())
 
     def cog_unload(self) -> None:
         # Cancel pending auto-unlock tasks; channel overwrites of an active
-        # lockdown are NOT reverted here (a moderator can undo them manually).
+        # lockdown are NOT reverted here. The saved state stays in Config and
+        # is restored (or lifted, if expired) on the next load.
+        restore = getattr(self, "_restore_task", None)
+        if restore is not None:
+            restore.cancel()
         for state in self._lockdowns.values():
             task = state.get("task")
             if task is not None:
                 task.cancel()
         self._lockdowns.clear()
         unregister_dashboard(self)
+
+    async def _restore_lockdowns(self) -> None:
+        """Re-arm (or lift, if already expired) lockdowns persisted before a restart."""
+        try:
+            await self.bot.wait_until_red_ready()
+            all_guilds = await self.config.all_guilds()
+            for gid, data in all_guilds.items():
+                saved = data.get("lockdown_state")
+                if not saved:
+                    continue
+                guild = self.bot.get_guild(int(gid))
+                if guild is None or guild.id in self._lockdowns:
+                    continue
+                prior = {int(k): v for k, v in (saved.get("overwrites") or {}).items()}
+                state: dict = {"overwrites": prior, "task": None}
+                self._lockdowns[guild.id] = state
+                remaining = float(saved.get("until") or 0) - time.time()
+                if remaining <= 0:
+                    await self._disable_lockdown(guild)
+                else:
+                    state["task"] = asyncio.create_task(self._auto_unlock(guild, remaining))
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("Restoring persisted lockdowns failed")
+
+    async def _auto_unlock(self, guild: discord.Guild, seconds: float) -> None:
+        try:
+            await asyncio.sleep(max(1.0, seconds))
+            await self._disable_lockdown(guild)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("Auto-unlock failed for guild %s", guild.id)
 
     async def red_delete_data_for_user(self, *, requester, user_id: int) -> None:
         """Nothing is persisted; purge the transient in-memory counters."""
@@ -314,39 +487,31 @@ class AutoModPlus(commands.Cog):
     # ------------------------------------------------------------------ #
     # Regex filter
     # ------------------------------------------------------------------ #
-    def _compile_pattern(self, pattern: str) -> Optional[re.Pattern]:
+    def _compile_pattern(self, pattern: str):
         rx = self._regex_cache.get(pattern)
         if rx is not None:
             return rx
         try:
-            rx = re.compile(pattern, re.IGNORECASE)
-        except re.error:
+            rx = _compile_user_regex(pattern)
+        except Exception:
             return None
+        if len(self._regex_cache) >= MAX_REGEX_CACHE:
+            self._regex_cache.clear()
         self._regex_cache[pattern] = rx
         return rx
 
     async def _regex_matches(self, pattern: str, content: str) -> bool:
-        rx = self._compile_pattern(pattern)
-        if rx is None:
-            return False
-        try:
-            # Run in a thread and bound the wait: a pathological pattern can
-            # at worst waste one worker thread, never the event loop.
-            match = await asyncio.wait_for(
-                asyncio.to_thread(rx.search, content[:MAX_CONTENT_SCAN]),
-                timeout=REGEX_TIMEOUT,
-            )
-            return match is not None
-        except asyncio.TimeoutError:
-            log.warning("Regex filter timed out (pattern skipped): %r", pattern[:50])
-            return False
-        except Exception:
-            return False
+        return await self._regex_match_any([pattern], content) is not None
 
     async def _regex_match_any(self, patterns: List[str], content: str) -> Optional[int]:
         """Check all patterns in a SINGLE worker thread with one overall time
-        budget. Returns the index of the first matching pattern, or None."""
-        compiled: List[Tuple[int, re.Pattern]] = []
+        budget. Returns the index of the first matching pattern, or None.
+
+        With the `regex` package every search gets a hard timeout and runs with
+        the GIL released (concurrent=True), so a pathological pattern can neither
+        stall the event loop nor keep a worker thread busy. The stdlib fallback
+        cannot be interrupted; risky patterns are rejected when they are added."""
+        compiled: List[Tuple[int, object]] = []
         for idx, pattern in enumerate(patterns):
             if not pattern:
                 continue
@@ -358,16 +523,28 @@ class AutoModPlus(commands.Cog):
         text = content[:MAX_CONTENT_SCAN]
 
         def _scan() -> Optional[int]:
+            deadline = time.monotonic() + REGEX_TOTAL_BUDGET
             for idx, rx in compiled:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    log.warning("Regex filter budget exhausted (remaining patterns skipped)")
+                    return None
                 try:
-                    if rx.search(text):
+                    if _regex is not None:
+                        hit = rx.search(text, timeout=min(REGEX_TIMEOUT, remaining), concurrent=True)
+                    else:
+                        hit = rx.search(text)
+                    if hit:
                         return idx
+                except TimeoutError:
+                    log.warning("Regex filter #%s timed out (pattern skipped)", idx + 1)
+                    continue
                 except Exception:
                     continue
             return None
 
         try:
-            return await asyncio.wait_for(asyncio.to_thread(_scan), timeout=REGEX_TIMEOUT)
+            return await asyncio.wait_for(asyncio.to_thread(_scan), timeout=REGEX_TOTAL_BUDGET + 0.5)
         except asyncio.TimeoutError:
             log.warning("Regex filters timed out (message skipped)")
             return None
@@ -385,12 +562,25 @@ class AutoModPlus(commands.Cog):
         except Exception:
             log.exception("AutoModPlus message processing failed")
 
-    async def _process_message(self, message: discord.Message) -> None:
+    @commands.Cog.listener()
+    async def on_message_edit(self, before: discord.Message, after: discord.Message) -> None:
+        # Edits must not bypass the content rules. Rate-based rules (flood,
+        # duplicate, attachment spam) only count newly sent messages.
+        if before.content == after.content:
+            return
+        try:
+            await self._process_message(after, edited=True)
+        except Exception:
+            log.exception("AutoModPlus edit processing failed")
+
+    async def _process_message(self, message: discord.Message, edited: bool = False) -> None:
         guild = message.guild
         if guild is None or message.author.bot or message.webhook_id is not None:
             return
         member = message.author
         if not isinstance(member, discord.Member):
+            return
+        if await self.bot.cog_disabled_in_guild(self, guild):
             return
 
         data = await self.config.guild(guild).all()
@@ -422,7 +612,7 @@ class AutoModPlus(commands.Cog):
             )
 
         # ---- flood ---- #
-        rule = active("flood")
+        rule = None if edited else active("flood")
         if rule:
             dq = self._window(self._flood, (gid, uid), max(1, int(rule["seconds"])))
             dq.append(time.monotonic())
@@ -431,7 +621,7 @@ class AutoModPlus(commands.Cog):
                 return await trigger("flood", rule, f"{rule['count']} msgs / {rule['seconds']}s")
 
         # ---- duplicate messages (content hashed, never stored raw) ---- #
-        rule = active("duplicate")
+        rule = None if edited else active("duplicate")
         if rule and content:
             key = (gid, uid)
             dq = self._dupes.setdefault(key, deque(maxlen=50))
@@ -485,7 +675,7 @@ class AutoModPlus(commands.Cog):
                 return await trigger("links", rule, f"link: {hit}")
 
         # ---- attachment spam ---- #
-        rule = active("attachments")
+        rule = None if edited else active("attachments")
         if rule and message.attachments:
             dq = self._window(self._attach, (gid, uid), max(1, int(rule["seconds"])))
             dq.append(time.monotonic())
@@ -529,6 +719,8 @@ class AutoModPlus(commands.Cog):
 
     async def _process_join(self, member: discord.Member) -> None:
         guild = member.guild
+        if await self.bot.cog_disabled_in_guild(self, guild):
+            return
         ar = {**DEFAULT_ANTIRAID, **(await self.config.guild(guild).antiraid())}
         if not ar.get("enabled"):
             return
@@ -596,6 +788,10 @@ class AutoModPlus(commands.Cog):
         # start a second lockdown and clobber the saved overwrites.
         state: dict = {"overwrites": {}, "task": None}
         self._lockdowns[guild.id] = state
+        if await self.config.guild(guild).lockdown_state():
+            # A persisted lockdown (from before a restart) is still pending.
+            self._lockdowns.pop(guild.id, None)
+            return False
 
         ar = {**DEFAULT_ANTIRAID, **(await self.config.guild(guild).antiraid())}
         ids = ar.get("lockdown_channels") or []
@@ -621,16 +817,11 @@ class AutoModPlus(commands.Cog):
             self._lockdowns.pop(guild.id, None)
             return False
 
-        async def _auto_unlock() -> None:
-            try:
-                await asyncio.sleep(max(1, minutes) * 60)
-                await self._disable_lockdown(guild)
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                log.exception("Auto-unlock failed for guild %s", guild.id)
-
-        state["task"] = asyncio.create_task(_auto_unlock())
+        seconds = max(1, minutes) * 60
+        await self.config.guild(guild).lockdown_state.set(
+            {"until": time.time() + seconds, "overwrites": {str(k): v for k, v in prior.items()}}
+        )
+        state["task"] = asyncio.create_task(self._auto_unlock(guild, seconds))
         lang = await self._lang(guild)
         await self._log_action(
             guild, tr_lang(lang, "Anti-Raid", "Anti-raid"), "lockdown", None,
@@ -641,10 +832,15 @@ class AutoModPlus(commands.Cog):
 
     async def _disable_lockdown(self, guild: discord.Guild) -> bool:
         state = self._lockdowns.pop(guild.id, None)
+        saved = await self.config.guild(guild).lockdown_state()
+        if state is None and saved:
+            # Lockdown from before a restart that has not been re-armed yet.
+            state = {"overwrites": {int(k): v for k, v in (saved.get("overwrites") or {}).items()}, "task": None}
         if state is None:
             return False
+        await self.config.guild(guild).lockdown_state.clear()
         task = state.get("task")
-        if task is not None and not task.done():
+        if task is not None and not task.done() and task is not asyncio.current_task():
             task.cancel()
         role = guild.default_role
         for cid, prior in state.get("overwrites", {}).items():
@@ -670,10 +866,12 @@ class AutoModPlus(commands.Cog):
     @commands.hybrid_group(name="automodplus", aliases=["amp"])
     @commands.guild_only()
     @commands.admin_or_permissions(manage_guild=True)
+    @app_commands.default_permissions(manage_guild=True)
     async def amp(self, ctx: commands.Context) -> None:
         """Configure AutoModPlus (anti-spam, anti-raid, regex filter)."""
 
     @amp.command(name="status")
+    @commands.admin_or_permissions(manage_guild=True)
     async def amp_status(self, ctx: commands.Context) -> None:
         """Show all rules with their state and actions."""
         data = await self.config.guild(ctx.guild).all()
@@ -698,6 +896,7 @@ class AutoModPlus(commands.Cog):
         await ctx.send(embed=emb)
 
     @amp.command(name="logchannel")
+    @commands.admin_or_permissions(manage_guild=True)
     async def amp_logchannel(self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None) -> None:
         """Set (or clear) the action log channel."""
         lang = await self._lang(ctx.guild)
@@ -709,6 +908,7 @@ class AutoModPlus(commands.Cog):
             await ctx.send(tr_lang(lang, f"Log-Kanal: {channel.mention}", f"Log channel: {channel.mention}"))
 
     @amp.command(name="language")
+    @commands.admin_or_permissions(manage_guild=True)
     async def amp_language(self, ctx: commands.Context, language: str) -> None:
         """Set the output language (de/en)."""
         language = "de-DE" if language.lower().startswith("de") else "en-US"
@@ -716,6 +916,7 @@ class AutoModPlus(commands.Cog):
         await ctx.send(tr_lang(language, "Sprache: Deutsch", "Language: English"))
 
     @amp.command(name="exemptmods")
+    @commands.admin_or_permissions(manage_guild=True)
     async def amp_exemptmods(self, ctx: commands.Context, enabled: bool) -> None:
         """Toggle the global mod/admin exemption (default: on)."""
         await self.config.guild(ctx.guild).exempt_mods.set(bool(enabled))
@@ -726,6 +927,7 @@ class AutoModPlus(commands.Cog):
 
     # ---- rule configuration ---- #
     @amp.group(name="rule")
+    @commands.admin_or_permissions(manage_guild=True)
     async def amp_rule(self, ctx: commands.Context) -> None:
         """Configure a single rule (flood, duplicate, mentions, emoji, invites, links, attachments, caps)."""
 
@@ -746,6 +948,7 @@ class AutoModPlus(commands.Cog):
             rules[rule] = cur
 
     @amp_rule.command(name="enable")
+    @commands.admin_or_permissions(manage_guild=True)
     async def rule_enable(self, ctx: commands.Context, rule: str) -> None:
         """Enable a rule."""
         key = await self._get_rule(ctx, rule)
@@ -756,6 +959,7 @@ class AutoModPlus(commands.Cog):
         await ctx.send(tr_lang(lang, f"Regel `{key}` aktiviert.", f"Rule `{key}` enabled."))
 
     @amp_rule.command(name="disable")
+    @commands.admin_or_permissions(manage_guild=True)
     async def rule_disable(self, ctx: commands.Context, rule: str) -> None:
         """Disable a rule."""
         key = await self._get_rule(ctx, rule)
@@ -766,6 +970,7 @@ class AutoModPlus(commands.Cog):
         await ctx.send(tr_lang(lang, f"Regel `{key}` deaktiviert.", f"Rule `{key}` disabled."))
 
     @amp_rule.command(name="action")
+    @commands.admin_or_permissions(manage_guild=True)
     async def rule_action(self, ctx: commands.Context, rule: str, action: str, timeout_minutes: int = 10) -> None:
         """Set the action for a rule: delete / warn / timeout / kick / ban."""
         key = await self._get_rule(ctx, rule)
@@ -782,6 +987,7 @@ class AutoModPlus(commands.Cog):
         await ctx.send(tr_lang(lang, f"Regel `{key}`: Aktion `{action}`.", f"Rule `{key}`: action `{action}`."))
 
     @amp_rule.command(name="threshold")
+    @commands.admin_or_permissions(manage_guild=True)
     async def rule_threshold(self, ctx: commands.Context, rule: str, count: int, seconds: int = 0) -> None:
         """Set a rule's threshold (count and, where applicable, window seconds)."""
         key = await self._get_rule(ctx, rule)
@@ -795,6 +1001,7 @@ class AutoModPlus(commands.Cog):
         await ctx.send(tr_lang(lang, f"Regel `{key}`: Schwelle gesetzt.", f"Rule `{key}`: threshold set."))
 
     @amp_rule.command(name="exemptrole")
+    @commands.admin_or_permissions(manage_guild=True)
     async def rule_exemptrole(self, ctx: commands.Context, rule: str, mode: str, role: discord.Role) -> None:
         """Add or remove an exempt role for a rule (mode: add/remove)."""
         key = await self._get_rule(ctx, rule)
@@ -814,6 +1021,7 @@ class AutoModPlus(commands.Cog):
                                f"Rule `{key}`: exempt roles updated."))
 
     @amp_rule.command(name="exemptchannel")
+    @commands.admin_or_permissions(manage_guild=True)
     async def rule_exemptchannel(self, ctx: commands.Context, rule: str, mode: str, channel: discord.TextChannel) -> None:
         """Add or remove an exempt channel for a rule (mode: add/remove)."""
         key = await self._get_rule(ctx, rule)
@@ -833,6 +1041,7 @@ class AutoModPlus(commands.Cog):
                                f"Rule `{key}`: exempt channels updated."))
 
     @amp.command(name="capsratio")
+    @commands.admin_or_permissions(manage_guild=True)
     async def amp_capsratio(self, ctx: commands.Context, percent: int) -> None:
         """Set the ALL-CAPS trigger ratio in percent (e.g. 80)."""
         await self._update_rule(ctx.guild, "caps", ratio=max(10, min(100, percent)))
@@ -840,6 +1049,7 @@ class AutoModPlus(commands.Cog):
         await ctx.send(tr_lang(lang, f"CAPS-Schwelle: {percent}%", f"Caps threshold: {percent}%"))
 
     @amp.command(name="inviteallow")
+    @commands.admin_or_permissions(manage_guild=True)
     async def amp_inviteallow(self, ctx: commands.Context, mode: str, code: Optional[str] = None) -> None:
         """Manage the invite allowlist (mode: add/remove/list)."""
         lang = await self._lang(ctx.guild)
@@ -862,6 +1072,7 @@ class AutoModPlus(commands.Cog):
         await ctx.send(tr_lang(lang, "Invite-Allowlist aktualisiert.", "Invite allowlist updated."))
 
     @amp.command(name="linkmode")
+    @commands.admin_or_permissions(manage_guild=True)
     async def amp_linkmode(self, ctx: commands.Context, mode: str) -> None:
         """Set the link filter mode: block (blocklist) or allow (allowlist only)."""
         lang = await self._lang(ctx.guild)
@@ -872,6 +1083,7 @@ class AutoModPlus(commands.Cog):
         await ctx.send(tr_lang(lang, f"Link-Modus: `{mode}`", f"Link mode: `{mode}`"))
 
     @amp.command(name="linkdomain")
+    @commands.admin_or_permissions(manage_guild=True)
     async def amp_linkdomain(self, ctx: commands.Context, mode: str, domain: Optional[str] = None) -> None:
         """Manage the link domain list (mode: add/remove/list)."""
         lang = await self._lang(ctx.guild)
@@ -895,10 +1107,12 @@ class AutoModPlus(commands.Cog):
 
     # ---- regex filter ---- #
     @amp.group(name="regex")
+    @commands.admin_or_permissions(manage_guild=True)
     async def amp_regex(self, ctx: commands.Context) -> None:
         """Manage the regex word filter."""
 
     @amp_regex.command(name="add")
+    @commands.admin_or_permissions(manage_guild=True)
     async def regex_add(self, ctx: commands.Context, action: str, timeout_minutes: int, *, pattern: str) -> None:
         """Add a regex pattern: action (delete/warn/timeout/kick/ban), timeout minutes, pattern."""
         lang = await self._lang(ctx.guild)
@@ -914,8 +1128,18 @@ class AutoModPlus(commands.Cog):
                                           f"Pattern must be 1–{MAX_PATTERN_LENGTH} characters long."))
         try:
             re.compile(pattern, re.IGNORECASE)
-        except re.error as e:
+            _compile_user_regex(pattern)
+        except Exception as e:
             return await ctx.send(tr_lang(lang, f"Ungültiges Regex-Muster: `{e}`", f"Invalid regex pattern: `{e}`"))
+        risk = _pattern_risk(pattern)
+        if risk is not None:
+            return await ctx.send(tr_lang(
+                lang,
+                "Muster abgelehnt: verschachtelte Quantifizierer wie `(a+)+` oder überlappende "
+                "Alternativen wie `(a|a)*` können den Bot ausbremsen. Bitte vereinfachen.",
+                "Pattern rejected: nested quantifiers like `(a+)+` or overlapping alternatives "
+                "like `(a|a)*` can stall the bot. Please simplify it.",
+            ))
         async with self.config.guild(ctx.guild).regex_filters() as filters:
             if len(filters) >= MAX_PATTERNS_PER_GUILD:
                 return await ctx.send(tr_lang(lang,
@@ -929,6 +1153,7 @@ class AutoModPlus(commands.Cog):
         await ctx.send(tr_lang(lang, "Regex-Filter hinzugefügt.", "Regex filter added."))
 
     @amp_regex.command(name="remove")
+    @commands.admin_or_permissions(manage_guild=True)
     async def regex_remove(self, ctx: commands.Context, index: int) -> None:
         """Remove a regex pattern by its list number (see `regex list`)."""
         lang = await self._lang(ctx.guild)
@@ -939,6 +1164,7 @@ class AutoModPlus(commands.Cog):
         await ctx.send(tr_lang(lang, "Regex-Filter entfernt.", "Regex filter removed."))
 
     @amp_regex.command(name="list")
+    @commands.admin_or_permissions(manage_guild=True)
     async def regex_list(self, ctx: commands.Context) -> None:
         """List all regex patterns."""
         lang = await self._lang(ctx.guild)
@@ -953,6 +1179,7 @@ class AutoModPlus(commands.Cog):
 
     # ---- anti-raid ---- #
     @amp.group(name="raid")
+    @commands.admin_or_permissions(manage_guild=True)
     async def amp_raid(self, ctx: commands.Context) -> None:
         """Configure join-surge (raid) detection."""
 
@@ -964,6 +1191,7 @@ class AutoModPlus(commands.Cog):
             ar.update(merged)
 
     @amp_raid.command(name="enable")
+    @commands.admin_or_permissions(manage_guild=True)
     async def raid_enable(self, ctx: commands.Context) -> None:
         """Enable raid detection."""
         await self._update_raid(ctx.guild, enabled=True)
@@ -971,6 +1199,7 @@ class AutoModPlus(commands.Cog):
         await ctx.send(tr_lang(lang, "Anti-Raid aktiviert.", "Anti-raid enabled."))
 
     @amp_raid.command(name="disable")
+    @commands.admin_or_permissions(manage_guild=True)
     async def raid_disable(self, ctx: commands.Context) -> None:
         """Disable raid detection."""
         await self._update_raid(ctx.guild, enabled=False)
@@ -978,6 +1207,7 @@ class AutoModPlus(commands.Cog):
         await ctx.send(tr_lang(lang, "Anti-Raid deaktiviert.", "Anti-raid disabled."))
 
     @amp_raid.command(name="threshold")
+    @commands.admin_or_permissions(manage_guild=True)
     async def raid_threshold(self, ctx: commands.Context, joins: int, seconds: int) -> None:
         """Set the surge threshold: X joins within Y seconds."""
         await self._update_raid(ctx.guild, joins=max(2, min(500, joins)), seconds=max(5, min(3600, seconds)))
@@ -986,6 +1216,7 @@ class AutoModPlus(commands.Cog):
                                f"Threshold: {joins} joins / {seconds}s"))
 
     @amp_raid.command(name="action")
+    @commands.admin_or_permissions(manage_guild=True)
     async def raid_action(self, ctx: commands.Context, action: str) -> None:
         """Set the raid response: alert / lockdown / kick."""
         lang = await self._lang(ctx.guild)
@@ -998,6 +1229,7 @@ class AutoModPlus(commands.Cog):
         await ctx.send(tr_lang(lang, f"Raid-Aktion: `{action}`", f"Raid action: `{action}`"))
 
     @amp_raid.command(name="alertchannel")
+    @commands.admin_or_permissions(manage_guild=True)
     async def raid_alertchannel(self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None) -> None:
         """Set (or clear) the raid alert channel."""
         await self._update_raid(ctx.guild, alert_channel=channel.id if channel else None)
@@ -1007,6 +1239,7 @@ class AutoModPlus(commands.Cog):
                                f"Alert channel: {channel.mention if channel else '—'}"))
 
     @amp_raid.command(name="lockdownchannel")
+    @commands.admin_or_permissions(manage_guild=True)
     async def raid_lockdownchannel(self, ctx: commands.Context, mode: str, channel: discord.TextChannel) -> None:
         """Add or remove a lockdown channel (mode: add/remove). Empty list = all text channels."""
         lang = await self._lang(ctx.guild)
@@ -1023,6 +1256,7 @@ class AutoModPlus(commands.Cog):
         await ctx.send(tr_lang(lang, "Lockdown-Kanäle aktualisiert.", "Lockdown channels updated."))
 
     @amp_raid.command(name="duration")
+    @commands.admin_or_permissions(manage_guild=True)
     async def raid_duration(self, ctx: commands.Context, minutes: int) -> None:
         """Set the lockdown/raid-window duration in minutes."""
         await self._update_raid(ctx.guild, lockdown_minutes=max(1, min(1440, minutes)))
@@ -1031,6 +1265,7 @@ class AutoModPlus(commands.Cog):
 
     @amp.command(name="lockdown")
     @commands.bot_has_guild_permissions(manage_channels=True)
+    @commands.admin_or_permissions(manage_guild=True)
     async def amp_lockdown(self, ctx: commands.Context, minutes: Optional[int] = None) -> None:
         """Manually enable lockdown (removes @everyone send permission in the configured channels)."""
         lang = await self._lang(ctx.guild)
@@ -1045,6 +1280,7 @@ class AutoModPlus(commands.Cog):
 
     @amp.command(name="unlock")
     @commands.bot_has_guild_permissions(manage_channels=True)
+    @commands.admin_or_permissions(manage_guild=True)
     async def amp_unlock(self, ctx: commands.Context) -> None:
         """Manually lift an active lockdown."""
         lang = await self._lang(ctx.guild)

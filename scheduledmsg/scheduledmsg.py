@@ -258,6 +258,8 @@ class ScheduledMsg(commands.Cog):
             guild = self.bot.get_guild(gid)
             if guild is None:
                 continue
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                continue
             tz = _tzinfo(gconf.get("timezone"))
             catchup = str(gconf.get("catchup") or "skip")
             lang = str(gconf.get("language") or "en-US")
@@ -318,6 +320,31 @@ class ScheduledMsg(commands.Cog):
                         merged.append(job)
                     current[:] = merged
 
+    async def _author_can_target(self, ctx: commands.Context, channel: discord.abc.GuildChannel) -> bool:
+        """Check the invoker's rights in the *target* channel, not the current one.
+
+        Allowed: bot owner; members with manage_messages in the target channel;
+        or members who can send messages there and are mod/admin in Red.
+        """
+        author = ctx.author
+        if await self.bot.is_owner(author):
+            return True
+        if not isinstance(author, discord.Member) or channel.guild != ctx.guild:
+            return False
+        perms = channel.permissions_for(author)
+        if not perms.view_channel:
+            return False
+        if perms.manage_messages:
+            return True
+        return perms.send_messages and await self.bot.is_mod(author)
+
+    async def _deny_target(self, ctx: commands.Context, channel, lang: str) -> None:
+        await ctx.send(self._t(
+            lang,
+            f"Du hast in {channel.mention} nicht die nötigen Rechte (Nachrichten verwalten bzw. senden + Mod).",
+            f"You lack the required permissions in {channel.mention} (manage messages, or send messages + mod).",
+        ))
+
     # ------------------------------------------------------------------ #
     # Commands (core management: moderators and up)
     # ------------------------------------------------------------------ #
@@ -345,6 +372,9 @@ class ScheduledMsg(commands.Cog):
         Placeholders: {server}, {member_count}, {channel}, {date}, {time}.
         """
         lang = await self._lang(ctx.guild)
+        if not await self._author_can_target(ctx, channel):
+            await self._deny_target(ctx, channel, lang)
+            return
         if "|" not in spec_and_message:
             await ctx.send(self._t(
                 lang,
@@ -408,6 +438,9 @@ class ScheduledMsg(commands.Cog):
             except commands.BadArgument:
                 await ctx.send(self._t(lang, "Kanal nicht gefunden.", "Channel not found."))
                 return
+            if not await self._author_can_target(ctx, new_channel):
+                await self._deny_target(ctx, new_channel, lang)
+                return
         elif field == "spec":
             tz = await self._tz(ctx.guild)
             nxt = compute_next(value, datetime.datetime.now(datetime.timezone.utc), tz)
@@ -418,6 +451,14 @@ class ScheduledMsg(commands.Cog):
         elif not value:
             await ctx.send(self._t(lang, "Nachricht fehlt.", "Message is empty."))
             return
+
+        # The invoker must also have rights in the job's *current* channel.
+        current_job = next((j for j in await self.config.guild(ctx.guild).jobs() if j.get("id") == job_id), None)
+        if current_job is not None:
+            cur_ch = ctx.guild.get_channel(int(current_job.get("channel", 0) or 0))
+            if cur_ch is not None and not await self._author_can_target(ctx, cur_ch):
+                await self._deny_target(ctx, cur_ch, lang)
+                return
 
         updated = None
         async with self.config.guild(ctx.guild).jobs() as jobs:

@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 
 import discord
@@ -65,6 +66,10 @@ class EventMessages(commands.Cog):
         self.config.register_guild(**default_guild)
         self._dashboard_attached = False
         self._selected_event = {}  # (guild_id, user_id) -> event_id
+        # (guild_id, member_id) -> task that reports a timeout's natural expiry.
+        # Discord sends no member update when a timeout simply runs out.
+        self._timeout_tasks: Dict[tuple, asyncio.Task] = {}
+        self._startup_task: Optional[asyncio.Task] = None
 
     def _get_dashboard_cog(self) -> Optional[commands.Cog]:
         return self.bot.get_cog("pdc_webdashboard") or self.bot.get_cog("WebDashboard") or self.bot.get_cog("Dashboard")
@@ -85,8 +90,14 @@ class EventMessages(commands.Cog):
         dashboard_cog = self._get_dashboard_cog()
         if dashboard_cog is not None:
             self._dashboard_attached = self._attach_to_dashboard(dashboard_cog)
+        self._startup_task = asyncio.create_task(self._schedule_existing_timeouts())
 
     async def cog_unload(self) -> None:
+        if self._startup_task is not None:
+            self._startup_task.cancel()
+        for task in self._timeout_tasks.values():
+            task.cancel()
+        self._timeout_tasks.clear()
         unregister_dashboard(self)
         dashboard_cog = self._get_dashboard_cog()
         if dashboard_cog is not None:
@@ -151,7 +162,6 @@ class EventMessages(commands.Cog):
                 templates = {}
 
             cfg = events.get(selection, {}) if isinstance(events.get(selection), dict) else {}
-            name = labels.get(selection, selection)
 
             variables = [
                 {"token": "{display_name}", "desc": "Display name"},
@@ -378,13 +388,13 @@ class EventMessages(commands.Cog):
             "en-US": "Shows the status of all events.",
         }},
     )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
     async def em_status(self, interaction: discord.Interaction):
         """Show the current event-message configuration."""
         guild = interaction.guild
-        if guild is None:
-            await interaction.response.send_message(
-                "This command can only be used in a server.", ephemeral=True
-            )
+        # Same tier as em-enabled/em-channel (shows the log configuration).
+        if not await self._check_manage_guild(interaction):
             return
         await interaction.response.defer(ephemeral=True)
 
@@ -411,7 +421,89 @@ class EventMessages(commands.Cog):
     # Helpers
     # ------------------------------------------------------------
 
+    async def _active(self, guild: Optional[discord.Guild], event: str) -> bool:
+        """Event enabled with a channel and cog not disabled in the guild.
+        Checked BEFORE any audit-log lookup."""
+        if guild is None:
+            return False
+        if await self.bot.cog_disabled_in_guild(self, guild):
+            return False
+        data = await self.config.guild(guild).events()
+        conf = data.get(event) or {}
+        return bool(conf.get("enabled") and conf.get("channel"))
+
+    async def _was_banned(self, guild: discord.Guild, user: discord.abc.User) -> bool:
+        """Best effort: is this removal part of a ban? (reported by on_member_ban)"""
+        me = guild.me
+        if me is not None and me.guild_permissions.ban_members:
+            try:
+                await guild.fetch_ban(user)
+                return True
+            except discord.NotFound:
+                return False
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        return await self._find_audit_entry(guild, discord.AuditLogAction.ban, user.id) is not None
+
+    def _schedule_timeout_end(self, member: discord.Member) -> None:
+        key = (member.guild.id, member.id)
+        old = self._timeout_tasks.pop(key, None)
+        if old is not None:
+            old.cancel()
+        until = member.timed_out_until
+        if until is None:
+            return
+        self._timeout_tasks[key] = asyncio.create_task(self._timeout_end_after(member.guild.id, member.id, until))
+
+    async def _timeout_end_after(self, guild_id: int, member_id: int, until: datetime.datetime) -> None:
+        key = (guild_id, member_id)
+        try:
+            delay = (until - discord.utils.utcnow()).total_seconds()
+            await asyncio.sleep(max(0.0, delay) + 2.0)
+            guild = self.bot.get_guild(guild_id)
+            member = guild.get_member(member_id) if guild else None
+            if member is None:
+                return
+            current = member.timed_out_until
+            if current is not None and current > discord.utils.utcnow():
+                return  # extended in the meantime (a new task was scheduled)
+            if not await self._active(guild, "timeout_end"):
+                return
+            await self._post(
+                guild,
+                "timeout_end",
+                await self._render_template(
+                    guild, "timeout_end", display_name=member.display_name, username=str(member)
+                ),
+            )
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+        finally:
+            if self._timeout_tasks.get(key) is asyncio.current_task():
+                self._timeout_tasks.pop(key, None)
+
+    async def _schedule_existing_timeouts(self) -> None:
+        """After a (re)load, re-arm expiry checks for members still timed out."""
+        try:
+            await self.bot.wait_until_red_ready()
+            now = discord.utils.utcnow()
+            for guild in list(self.bot.guilds):
+                if not await self._active(guild, "timeout_end"):
+                    continue
+                for member in guild.members:
+                    until = member.timed_out_until
+                    if until is not None and until > now:
+                        self._schedule_timeout_end(member)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
     async def _post(self, guild: discord.Guild, event: str, message: str):
+        if await self.bot.cog_disabled_in_guild(self, guild):
+            return
         data = await self.config.guild(guild).events()
         if not data[event]["enabled"]:
             return
@@ -476,6 +568,8 @@ class EventMessages(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
+        if not await self._active(member.guild, "join"):
+            return
         msg = await self._render_template(
             member.guild, "join", display_name=member.display_name, username=str(member)
         )
@@ -484,11 +578,20 @@ class EventMessages(commands.Cog):
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
         guild = member.guild
+        kick_on = await self._active(guild, "kick")
+        leave_on = await self._active(guild, "leave")
+        if not (kick_on or leave_on):
+            return
+        # A ban also fires on_member_remove; on_member_ban reports it.
+        if await self._was_banned(guild, member):
+            return
 
         # Check audit log: was the user kicked?
-        entry = await self._find_audit_entry(
-            guild, discord.AuditLogAction.kick, member.id, limit=5
-        )
+        entry = None
+        if kick_on:
+            entry = await self._find_audit_entry(
+                guild, discord.AuditLogAction.kick, member.id, limit=5
+            )
 
         if entry:
             # → This was a kick
@@ -521,6 +624,8 @@ class EventMessages(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_ban(self, guild, user):
+        if not await self._active(guild, "ban"):
+            return
         entry = await self._find_audit_entry(
             guild, discord.AuditLogAction.ban, user.id, limit=5
         )
@@ -543,6 +648,8 @@ class EventMessages(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_unban(self, guild, user):
+        if not await self._active(guild, "unban"):
+            return
         entry = await self._find_audit_entry(
             guild, discord.AuditLogAction.unban, user.id, limit=5
         )
@@ -565,8 +672,16 @@ class EventMessages(commands.Cog):
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         # Timeout set?
         if before.timed_out_until != after.timed_out_until:
-            # Timeout END
+            if await self.bot.cog_disabled_in_guild(self, after.guild):
+                return
+            # Timeout END (removed manually; natural expiry is handled by
+            # the scheduled check in _timeout_end_after)
             if before.timed_out_until and after.timed_out_until is None:
+                task = self._timeout_tasks.pop((after.guild.id, after.id), None)
+                if task is not None:
+                    task.cancel()
+                if not await self._active(after.guild, "timeout_end"):
+                    return
                 await self._post(
                     after.guild,
                     "timeout_end",
@@ -581,6 +696,10 @@ class EventMessages(commands.Cog):
 
             # Timeout START
             if after.timed_out_until:
+                if await self._active(after.guild, "timeout_end"):
+                    self._schedule_timeout_end(after)
+                if not await self._active(after.guild, "timeout"):
+                    return
                 # Fetch audit log
                 entry = await self._find_audit_entry(
                     after.guild,
@@ -686,10 +805,6 @@ class EventMessages(commands.Cog):
                 "redirect_url": kwargs.get("request_url"),
             }
 
-        channel_options = "".join(
-            [f"<option value=''>-- none --</option>"]
-            + [f"<option value='{c.id}'>#{c.name} ({c.id})</option>" for c in guild.text_channels]
-        )
         rows = []
         for ev in EVENTS:
             enabled_checked = "checked" if events[ev]["enabled"] else ""

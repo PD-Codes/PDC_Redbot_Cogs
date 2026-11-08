@@ -20,9 +20,6 @@ Both can exist at the same time in the same cog (see README.md).
 """
 from __future__ import annotations
 
-from typing import Any
-
-import discord
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 

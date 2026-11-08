@@ -5,6 +5,8 @@ import uuid
 from typing import Any, Dict, Optional
 import json
 import html
+import re
+from redbot.core.utils.chat_formatting import pagify
 
 log = logging.getLogger("red.pdc.reactionrole")
 
@@ -26,6 +28,80 @@ except Exception:
                 func.__dashboard_decorator_params__ = (args, kwargs)
                 return func
             return decorator
+
+_CUSTOM_EMOJI_RE = re.compile(r"<a?:[A-Za-z0-9_~]+:(\d+)>")
+
+# reason key -> (de, en) user-facing message
+ROLE_BLOCK_MESSAGES = {
+    "default": (
+        "❌ Diese Rolle kann nicht vergeben werden (verwaltete oder @everyone-Rolle).",
+        "❌ That role cannot be assigned (managed or @everyone role).",
+    ),
+    "managed": (
+        "❌ Diese Rolle kann nicht vergeben werden (verwaltete oder @everyone-Rolle).",
+        "❌ That role cannot be assigned (managed or @everyone role).",
+    ),
+    "admin": (
+        "❌ Rollen mit Administrator-Rechten können nicht per ReactionRole vergeben werden.",
+        "❌ Roles with the administrator permission cannot be assigned via ReactionRole.",
+    ),
+    "bot_hierarchy": (
+        "❌ Diese Rolle ist höher oder gleich der höchsten Rolle des Bots.",
+        "❌ That role is higher than or equal to the bot's top role.",
+    ),
+    "actor_hierarchy": (
+        "❌ Du kannst keine Rolle binden, die höher oder gleich deiner höchsten Rolle ist.",
+        "❌ You cannot bind a role that is higher than or equal to your top role.",
+    ),
+}
+
+
+def role_block_reason(role, *, bot_top_role, actor_top_role=None, actor_is_owner: bool = False) -> Optional[str]:
+    """Return why ``role`` must not be bound to a reaction, or None if it may.
+
+    Pure function (no I/O) shared by the command, the dashboard panels and the
+    legacy dashboard page. ``actor_is_owner`` (guild owner / bot owner) skips
+    only the actor hierarchy check; ``actor_top_role=None`` without owner
+    status rejects everything.
+    """
+    if role.is_default():
+        return "default"
+    if role.managed:
+        return "managed"
+    if role.permissions.administrator:
+        return "admin"
+    if bot_top_role is None or role >= bot_top_role:
+        return "bot_hierarchy"
+    if not actor_is_owner and (actor_top_role is None or role >= actor_top_role):
+        return "actor_hierarchy"
+    return None
+
+
+def assignable_roles(roles, *, bot_top_role, actor_top_role=None, actor_is_owner: bool = False) -> list:
+    """Filter ``roles`` down to those that may be offered in role pickers."""
+    return [
+        r for r in roles
+        if role_block_reason(r, bot_top_role=bot_top_role, actor_top_role=actor_top_role,
+                             actor_is_owner=actor_is_owner) is None
+    ]
+
+
+def emoji_matches(stored: str, emoji) -> bool:
+    """Compare a stored emoji string with a reaction/partial emoji.
+
+    Custom emojis are matched by ID so renamed or animated variants still match.
+    """
+    stored = str(stored or "").strip()
+    if str(emoji) == stored:
+        return True
+    emoji_id = getattr(emoji, "id", None)
+    if emoji_id is None:
+        return False
+    m = _CUSTOM_EMOJI_RE.fullmatch(stored)
+    if m:
+        return int(m.group(1)) == emoji_id
+    return stored.isdigit() and int(stored) == emoji_id
+
 
 class ReactionRole(commands.Cog):
     """Simple ReactionRole Cog"""
@@ -81,6 +157,37 @@ class ReactionRole(commands.Cog):
         if cog.qualified_name not in {"Dashboard", "WebDashboard", "pdc_webdashboard"}:
             return
         self._dashboard_attached = self._attach_to_dashboard(cog)
+
+    async def _actor_info(self, guild: discord.Guild, member: Optional[discord.Member], user_id: Optional[int]):
+        """Return (actor_top_role, actor_is_owner) for hierarchy checks."""
+        uid = getattr(member, "id", None) or user_id
+        is_owner = bool(uid is not None and (uid == guild.owner_id or uid in self.bot.owner_ids))
+        return (member.top_role if member is not None else None), is_owner
+
+    async def _dashboard_actor(self, ctx):
+        guild = ctx.guild
+        member = getattr(ctx, "member", None)
+        user = getattr(ctx, "user", None)
+        if member is None and user is not None:
+            member = guild.get_member(user.id)
+        return await self._actor_info(guild, member, getattr(user, "id", None))
+
+    async def _dashboard_role_options(self, ctx) -> list:
+        actor_top, is_owner = await self._dashboard_actor(ctx)
+        roles = assignable_roles(
+            reversed(ctx.guild.roles), bot_top_role=ctx.guild.me.top_role,
+            actor_top_role=actor_top, actor_is_owner=is_owner,
+        )
+        return [{"value": str(r.id), "label": r.name} for r in roles]
+
+    async def _dashboard_role_error(self, ctx, role) -> Optional[str]:
+        actor_top, is_owner = await self._dashboard_actor(ctx)
+        reason = role_block_reason(role, bot_top_role=ctx.guild.me.top_role,
+                                   actor_top_role=actor_top, actor_is_owner=is_owner)
+        if reason is None:
+            return None
+        de, en = ROLE_BLOCK_MESSAGES[reason]
+        return tr(ctx, de, en)
 
     @dashboard_widget("reactionrole_count", L("ReactionRoles", "ReactionRoles"), size="sm", permission="guild_member")
     async def reactionrole_count_widget(self, ctx):
@@ -146,11 +253,7 @@ class ReactionRole(commands.Cog):
         ch_opts = [{"value": "", "label": "— Select channel —"}] + [
             {"value": str(c.id), "label": "#" + c.name} for c in ctx.guild.text_channels
         ]
-        role_opts = [{"value": "", "label": "— Select role —"}] + [
-            {"value": str(r.id), "label": r.name}
-            for r in ctx.guild.roles
-            if not r.is_default() and not r.managed
-        ]
+        role_opts = [{"value": "", "label": "— Select role —"}] + await self._dashboard_role_options(ctx)
         return PanelSchema(
             description=tr(ctx, "Kanal, Nachrichten-ID, Emoji und Rolle angeben. Speichern legt die "
                         "ReactionRole an und setzt die Reaktion an der Nachricht.",
@@ -180,6 +283,9 @@ class ReactionRole(commands.Cog):
         role = guild.get_role(int(role_id))
         if role is None:
             return SubmitResult.fail(tr(ctx, "Rolle nicht gefunden.", "Role not found."), errors={"role": tr(ctx, "Ungültig", "Invalid")})
+        role_error = await self._dashboard_role_error(ctx, role)
+        if role_error:
+            return SubmitResult.fail(role_error, errors={"role": tr(ctx, "Nicht erlaubt", "Not allowed")})
         try:
             message_id = int(msg_raw)
         except ValueError:
@@ -260,10 +366,7 @@ class ReactionRole(commands.Cog):
         """
         data = await self.config.guild(ctx.guild).reactionroles()
         entry = (data or {}).get(item_id) or {}
-        role_options = [
-            {"value": str(r.id), "label": r.name}
-            for r in ctx.guild.roles if r.name != "@everyone"
-        ]
+        role_options = await self._dashboard_role_options(ctx)
         return PanelSchema(
             description=tr(ctx, "Zugewiesene Rolle ändern. Kanal/Nachricht/Emoji bleiben unverändert.", "Change the assigned role. Channel/message/emoji stay unchanged."),
             fields=[
@@ -277,6 +380,12 @@ class ReactionRole(commands.Cog):
         new_role = data.get("role_id")
         if not new_role or not str(new_role).isdigit():
             return SubmitResult.fail(tr(ctx, "Bitte eine gültige Rolle wählen.", "Please choose a valid role."))
+        role = ctx.guild.get_role(int(new_role))
+        if role is None:
+            return SubmitResult.fail(tr(ctx, "Rolle nicht gefunden.", "Role not found."))
+        role_error = await self._dashboard_role_error(ctx, role)
+        if role_error:
+            return SubmitResult.fail(role_error, errors={"role_id": tr(ctx, "Nicht erlaubt", "Not allowed")})
         async with self.config.guild(ctx.guild).reactionroles() as d:
             entry = d.get(item_id)
             if not isinstance(entry, dict):
@@ -331,25 +440,13 @@ class ReactionRole(commands.Cog):
         guild = ctx.guild
         channel = ctx.channel
 
-        # Role hierarchy / safety checks
-        if role.managed or role.is_default():
-            return await ctx.send(tr_lang(
-                lang,
-                "❌ Diese Rolle kann nicht vergeben werden (verwaltete oder @everyone-Rolle).",
-                "❌ That role cannot be assigned (managed or @everyone role).",
-            ))
-        if role >= guild.me.top_role:
-            return await ctx.send(tr_lang(
-                lang,
-                "❌ Diese Rolle ist höher oder gleich der höchsten Rolle des Bots.",
-                "❌ That role is higher than or equal to the bot's top role.",
-            ))
-        if ctx.author != guild.owner and role >= ctx.author.top_role:
-            return await ctx.send(tr_lang(
-                lang,
-                "❌ Du kannst keine Rolle binden, die höher oder gleich deiner höchsten Rolle ist.",
-                "❌ You cannot bind a role that is higher than or equal to your top role.",
-            ))
+        # Role hierarchy / safety checks (shared with the dashboard paths)
+        actor_top, is_owner = await self._actor_info(guild, ctx.author, ctx.author.id)
+        reason = role_block_reason(role, bot_top_role=guild.me.top_role,
+                                   actor_top_role=actor_top, actor_is_owner=is_owner)
+        if reason is not None:
+            de, en = ROLE_BLOCK_MESSAGES[reason]
+            return await ctx.send(tr_lang(lang, de, en))
 
         try:
             message = await channel.fetch_message(message_id)
@@ -440,7 +537,8 @@ class ReactionRole(commands.Cog):
                 f"MessageID: `{entry['message_id']}`"
             )
 
-        await ctx.send("\n".join(lines))
+        for page in pagify("\n".join(lines), page_length=1900):
+            await ctx.send(page)
 
     # -------------------------
     # EVENTS
@@ -453,6 +551,8 @@ class ReactionRole(commands.Cog):
         guild = self.bot.get_guild(payload.guild_id)
         if guild is None:
             return
+        if await self.bot.cog_disabled_in_guild(self, guild):
+            return
         member = payload.member or guild.get_member(payload.user_id)
 
         if member is None or member.bot:
@@ -463,7 +563,7 @@ class ReactionRole(commands.Cog):
         for entry in data.values():
             if (
                 payload.message_id == entry["message_id"]
-                and str(payload.emoji) == entry["emoji"]
+                and emoji_matches(entry["emoji"], payload.emoji)
             ):
                 role = guild.get_role(entry["role_id"])
                 if role:
@@ -484,6 +584,8 @@ class ReactionRole(commands.Cog):
         guild = self.bot.get_guild(payload.guild_id)
         if guild is None:
             return
+        if await self.bot.cog_disabled_in_guild(self, guild):
+            return
         # payload.member is not provided on reaction removal.
         member = guild.get_member(payload.user_id)
         if member is None:
@@ -500,7 +602,7 @@ class ReactionRole(commands.Cog):
         for entry in data.values():
             if (
                 payload.message_id == entry["message_id"]
-                and str(payload.emoji) == entry["emoji"]
+                and emoji_matches(entry["emoji"], payload.emoji)
             ):
                 role = guild.get_role(entry["role_id"])
                 if role:
@@ -533,6 +635,7 @@ class ReactionRole(commands.Cog):
             return await ctx.send(tr_lang(lang, "ℹ️ Keine ReactionRoles zum Synchronisieren.", "ℹ️ No ReactionRoles to synchronize."))
 
         added = 0
+        failed = 0
 
         for rr_id, entry in data.items():
             channel = guild.get_channel(entry["channel_id"])
@@ -548,9 +651,9 @@ class ReactionRole(commands.Cog):
             if not role:
                 continue
 
-            reaction = discord.utils.get(
-                message.reactions,
-                emoji=entry["emoji"]
+            reaction = next(
+                (r for r in message.reactions if emoji_matches(entry["emoji"], r.emoji)),
+                None,
             )
 
             if not reaction:
@@ -565,19 +668,25 @@ class ReactionRole(commands.Cog):
                     continue
 
                 if role not in member.roles:
-                    await member.add_roles(
-                        role,
-                        reason="ReactionRole manual sync"
-                    )
-                    added += 1
+                    try:
+                        await member.add_roles(
+                            role,
+                            reason="ReactionRole manual sync"
+                        )
+                        added += 1
+                    except discord.HTTPException:
+                        # One failing member (e.g. Forbidden) must not abort the sync.
+                        failed += 1
+                        log.debug("ReactionRole sync: add_roles failed for %s", member.id, exc_info=True)
 
-        await ctx.send(
-            tr_lang(
-                lang,
-                f"🔄 Synchronisation abgeschlossen\n➕ Rollen neu gesetzt: **{added}**",
-                f"🔄 Synchronization complete\n➕ Roles re-applied: **{added}**",
-            )
+        text = tr_lang(
+            lang,
+            f"🔄 Synchronisation abgeschlossen\n➕ Rollen neu gesetzt: **{added}**",
+            f"🔄 Synchronization complete\n➕ Roles re-applied: **{added}**",
         )
+        if failed:
+            text += tr_lang(lang, f"\n⚠️ Fehlgeschlagen: **{failed}**", f"\n⚠️ Failed: **{failed}**")
+        await ctx.send(text)
 
     async def _create_panel(
         self,
@@ -586,13 +695,19 @@ class ReactionRole(commands.Cog):
         content: str,
         mappings: list[dict[str, Any]],
         panel_id: Optional[str] = None,
+        actor_top_role: Optional[discord.Role] = None,
+        actor_is_owner: bool = False,
     ) -> str:
         message = await channel.send(content)
         valid_mappings = []
         for m in mappings:
             emoji = str(m["emoji"]).strip()
             role_id = int(m["role_id"])
-            if not emoji or not guild.get_role(role_id):
+            role = guild.get_role(role_id)
+            if not emoji or role is None:
+                continue
+            if role_block_reason(role, bot_top_role=guild.me.top_role, actor_top_role=actor_top_role,
+                                 actor_is_owner=actor_is_owner) is not None:
                 continue
             try:
                 await message.add_reaction(emoji)
@@ -692,9 +807,11 @@ class ReactionRole(commands.Cog):
         if guild is None:
             return {"status": 1, "message": "Guild not found."}
         member = guild.get_member(user_id)
-        if member is None or not (member.guild_permissions.manage_roles or member.guild_permissions.manage_guild):
+        # Binding roles requires manage_roles (manage_guild alone is not enough).
+        if member is None or not member.guild_permissions.manage_roles:
             if user_id not in self.bot.owner_ids:
                 return {"status": 1, "message": "Not allowed."}
+        actor_top, actor_is_owner = await self._actor_info(guild, member, user_id)
 
         rr = await self.config.guild(guild).reactionroles()
         panels = await self.config.guild(guild).panels()
@@ -745,15 +862,34 @@ class ReactionRole(commands.Cog):
                         "redirect_url": kwargs.get("request_url"),
                     }
 
+                # Same role checks as reactionrole-set, before anything is changed.
+                rejected = []
+                for mapping in mappings:
+                    role = guild.get_role(mapping["role_id"])
+                    if role is None:
+                        continue
+                    reason = role_block_reason(role, bot_top_role=guild.me.top_role,
+                                               actor_top_role=actor_top, actor_is_owner=actor_is_owner)
+                    if reason is not None:
+                        rejected.append(f"{role.name}: {ROLE_BLOCK_MESSAGES[reason][1]}")
+                if rejected:
+                    return {
+                        "status": 0,
+                        "notifications": [{"message": "; ".join(rejected)[:900], "category": "warning"}],
+                        "redirect_url": kwargs.get("request_url"),
+                    }
+
                 try:
                     if action == "update":
                         if not target_panel_id or target_panel_id not in panels:
                             raise ValueError("Select a valid existing panel to update.")
                         await self._delete_panel(guild, target_panel_id)
-                        await self._create_panel(guild, channel, content, mappings, panel_id=target_panel_id)
+                        await self._create_panel(guild, channel, content, mappings, panel_id=target_panel_id,
+                                                 actor_top_role=actor_top, actor_is_owner=actor_is_owner)
                         msg = "ReactionRole panel updated."
                     else:
-                        await self._create_panel(guild, channel, content, mappings)
+                        await self._create_panel(guild, channel, content, mappings,
+                                                 actor_top_role=actor_top, actor_is_owner=actor_is_owner)
                         msg = "ReactionRole panel created."
                 except ValueError as exc:
                     return {
@@ -848,7 +984,9 @@ class ReactionRole(commands.Cog):
         table = "".join(panel_rows) if panel_rows else "<tr><td colspan='4'><em>No entries</em></td></tr>"
 
         role_options = ["<option value=''>-- select role --</option>"] + [
-            f"<option value='{r.id}'>{html.escape(r.name)}</option>" for r in guild.roles if not r.is_default()
+            f"<option value='{r.id}'>{html.escape(r.name)}</option>"
+            for r in assignable_roles(reversed(guild.roles), bot_top_role=guild.me.top_role,
+                                      actor_top_role=actor_top, actor_is_owner=actor_is_owner)
         ]
         channel_options = ["<option value=''>-- select channel --</option>"] + [
             f"<option value='{c.id}'>{html.escape('#' + c.name)}</option>" for c in guild.text_channels

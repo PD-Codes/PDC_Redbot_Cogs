@@ -3,7 +3,7 @@ import discord
 from discord import app_commands
 from redbot.core import Config, commands
 from redbot.core.utils.menus import DEFAULT_CONTROLS, menu
-from typing import Any, Deque, Dict, List, Optional, Literal
+from typing import Any, Deque, Dict, List, Optional
 from datetime import timedelta
 from collections import deque
 import asyncio
@@ -18,6 +18,28 @@ from .pdc_dashboard import (
 )
 
 log = logging.getLogger("red.pdc.adminprotocol")
+
+# Discord limits per message: 10 embeds and 6000 characters across all embeds
+# (title, description, field names/values, footer text and author name).
+MAX_EMBEDS_PER_MESSAGE = 10
+MAX_EMBED_CHARS_PER_MESSAGE = 6000
+
+
+def _chunk_embeds(embeds: List[discord.Embed]) -> List[List[discord.Embed]]:
+    """Split embeds into message-sized batches (count AND total length)."""
+    chunks: List[List[discord.Embed]] = []
+    cur: List[discord.Embed] = []
+    total = 0
+    for emb in embeds:
+        size = len(emb)
+        if cur and (len(cur) >= MAX_EMBEDS_PER_MESSAGE or total + size > MAX_EMBED_CHARS_PER_MESSAGE):
+            chunks.append(cur)
+            cur, total = [], 0
+        cur.append(emb)
+        total += size
+    if cur:
+        chunks.append(cur)
+    return chunks
 
 try:
     from pdc_dashboard.rpc.third_parties import dashboard_page as _dashboard_page  # type: ignore
@@ -129,6 +151,8 @@ class AdminProtocol(commands.Cog):
         self._flush_task: Optional[asyncio.Task] = None
         # In-memory buffer of recent log entries per guild (for filtering).
         self._recent: Dict[int, Deque[dict]] = {}
+        # audit entry id -> last seen extra.count (voice move/disconnect attribution)
+        self._voice_audit_counts: Dict[int, int] = {}
 
     async def cog_load(self) -> None:
         dashboard = self.bot.get_cog("pdc_webdashboard") or self.bot.get_cog("WebDashboard") or self.bot.get_cog("Dashboard")
@@ -389,6 +413,20 @@ class AdminProtocol(commands.Cog):
 
         return False
 
+    async def _active(self, guild: Optional[discord.Guild], *events: str) -> bool:
+        """True when the cog is enabled in `guild` and at least one of `events`
+        is enabled with a log channel. Checked BEFORE any audit-log lookup."""
+        if guild is None:
+            return False
+        if await self.bot.cog_disabled_in_guild(self, guild):
+            return False
+        conf = await self.config.guild(guild).events()
+        for ev in events:
+            ev_conf = conf.get(ev) or {}
+            if ev_conf.get("enabled") and ev_conf.get("channel"):
+                return True
+        return False
+
     async def _post_embed(
         self,
         guild: discord.Guild,
@@ -400,6 +438,8 @@ class AdminProtocol(commands.Cog):
         role: Optional[discord.Role] = None,
         actor: Optional[discord.Member | discord.User] = None,
     ):
+        if await self.bot.cog_disabled_in_guild(self, guild):
+            return
         event_conf = await self.config.guild(guild).events.get_raw(event_name)
         if not event_conf.get("enabled", False):
             return
@@ -452,8 +492,7 @@ class AdminProtocol(commands.Cog):
                     channel = self.bot.get_channel(channel_id)
                     if channel is None:
                         continue
-                    for i in range(0, len(embeds), 10):
-                        chunk = embeds[i : i + 10]
+                    for chunk in _chunk_embeds(embeds):
                         try:
                             await channel.send(embeds=chunk)
                         except discord.Forbidden:
@@ -499,6 +538,68 @@ class AdminProtocol(commands.Cog):
             log.debug(f"Unexpected audit log error for action {action}: {e}")
         return None
 
+    async def _was_banned(self, guild: discord.Guild, member: discord.abc.User) -> bool:
+        """Best effort: was this removal caused by a ban?"""
+        me = guild.me
+        if me is not None and me.guild_permissions.ban_members:
+            try:
+                await guild.fetch_ban(member)
+                return True
+            except discord.NotFound:
+                return False
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        entry = await self._get_audit_log_entry(guild, discord.AuditLogAction.ban, target_id=member.id, retries=1)
+        return entry is not None
+
+    async def _voice_mod_entry(
+        self,
+        guild: discord.Guild,
+        action: discord.AuditLogAction,
+        channel_id: Optional[int] = None,
+    ) -> Optional[discord.AuditLogEntry]:
+        """Resolve the moderator of a voice move/disconnect.
+
+        member_move / member_disconnect audit entries carry NO target; Discord
+        aggregates them per moderator and bumps ``extra.count``. An entry is only
+        attributed when it is brand new (created within a few seconds) or its
+        count grew since we last looked, and - for moves - when its
+        ``extra.channel`` is the destination channel. Anything ambiguous yields
+        None (no moderator) rather than a wrong attribution.
+        """
+        me = guild.me
+        if me is None or not me.guild_permissions.view_audit_log:
+            return None
+        seen = self._voice_audit_counts
+        for attempt in range(2):
+            found = None
+            try:
+                now = discord.utils.utcnow()
+                async for entry in guild.audit_logs(action=action, limit=10):
+                    count = int(getattr(entry.extra, "count", 1) or 1)
+                    prev = seen.get(entry.id)
+                    seen[entry.id] = count
+                    if found is not None:
+                        continue
+                    if channel_id is not None:
+                        ch = getattr(entry.extra, "channel", None)
+                        if ch is None or ch.id != channel_id:
+                            continue
+                    fresh = prev is None and (now - entry.created_at).total_seconds() <= 10
+                    bumped = prev is not None and count > prev
+                    if fresh or bumped:
+                        found = entry
+            except (discord.Forbidden, discord.HTTPException):
+                return None
+            if len(seen) > 2000:
+                for key in list(seen)[:1000]:
+                    seen.pop(key, None)
+            if found is not None:
+                return found
+            if attempt == 0:
+                await asyncio.sleep(1.5)
+        return None
+
     def _is_mod_command(self, command_name: str, cog_name: Optional[str]) -> bool:
         if cog_name in {"Mod", "Admin", "AdminUtils"}:
             return True
@@ -515,6 +616,10 @@ class AdminProtocol(commands.Cog):
         if not after.guild or after.author.bot:
             return
         if before.content == after.content:
+            return
+
+        if not await self._active(after.guild, "message_edit"):
+
             return
 
         lang = await self.config.guild(after.guild).language()
@@ -539,6 +644,10 @@ class AdminProtocol(commands.Cog):
             return
         channel = guild.get_channel(payload.channel_id)
         if not channel:
+            return
+
+        if not await self._active(guild, "message_delete"):
+
             return
 
         lang = await self.config.guild(guild).language()
@@ -579,6 +688,8 @@ class AdminProtocol(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_ban(self, guild: discord.Guild, user: discord.User | discord.Member):
+        if not await self._active(guild, "user_ban"):
+            return
         lang = await self.config.guild(guild).language()
         entry = await self._get_audit_log_entry(guild, discord.AuditLogAction.ban, target_id=user.id)
         moderator = entry.user if entry else None
@@ -605,6 +716,8 @@ class AdminProtocol(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_unban(self, guild: discord.Guild, user: discord.User):
+        if not await self._active(guild, "user_unban"):
+            return
         lang = await self.config.guild(guild).language()
         entry = await self._get_audit_log_entry(guild, discord.AuditLogAction.unban, target_id=user.id)
         moderator = entry.user if entry else None
@@ -627,10 +740,19 @@ class AdminProtocol(commands.Cog):
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
         guild = member.guild
+        if not await self._active(guild, "user_kick", "user_leave"):
+            return
         lang = await self.config.guild(guild).language()
 
+        # A ban also fires on_member_remove; on_member_ban reports it, so no
+        # additional "left"/"kicked" entry is posted here.
+        if await self._was_banned(guild, member):
+            return
+
         # Check if member was kicked
-        entry = await self._get_audit_log_entry(guild, discord.AuditLogAction.kick, target_id=member.id)
+        entry = None
+        if await self._active(guild, "user_kick"):
+            entry = await self._get_audit_log_entry(guild, discord.AuditLogAction.kick, target_id=member.id)
 
         if entry:
             # Kick event
@@ -668,6 +790,8 @@ class AdminProtocol(commands.Cog):
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         guild = member.guild
+        if not await self._active(guild, "user_join"):
+            return
         lang = await self.config.guild(guild).language()
         created_at = member.created_at
         now = discord.utils.utcnow()
@@ -706,10 +830,12 @@ class AdminProtocol(commands.Cog):
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         guild = after.guild
+        if not await self._active(guild, "user_timeout", "nickname_change_other", "nickname_change_self", "role_add", "role_remove"):
+            return
         lang = await self.config.guild(guild).language()
 
         # 1. Timeout (gegeben / entfernt)
-        if before.timed_out_until != after.timed_out_until:
+        if before.timed_out_until != after.timed_out_until and await self._active(guild, "user_timeout"):
             entry = await self._get_audit_log_entry(guild, discord.AuditLogAction.member_update, target_id=after.id)
             moderator = entry.user if entry else None
             reason = entry.reason if entry and entry.reason else tr_lang(lang, "Keine Begründung angegeben", "No reason provided")
@@ -753,7 +879,7 @@ class AdminProtocol(commands.Cog):
                 await self._post_embed(guild, "user_timeout", embed, member=after, actor=moderator)
 
         # 2. Nickname changed
-        if before.nick != after.nick:
+        if before.nick != after.nick and await self._active(guild, "nickname_change_other", "nickname_change_self"):
             entry = await self._get_audit_log_entry(guild, discord.AuditLogAction.member_update, target_id=after.id)
             # Check if updated by someone else
             if entry and entry.user and entry.user.id != after.id:
@@ -795,6 +921,8 @@ class AdminProtocol(commands.Cog):
 
         # 3. Roles added
         added_roles = set(after.roles) - set(before.roles)
+        if added_roles and not await self._active(guild, "role_add"):
+            added_roles = set()
         for role in added_roles:
             entry = await self._get_audit_log_entry(guild, discord.AuditLogAction.member_role_update, target_id=after.id)
             moderator = entry.user if entry else None
@@ -817,6 +945,8 @@ class AdminProtocol(commands.Cog):
 
         # 4. Roles removed
         removed_roles = set(before.roles) - set(after.roles)
+        if removed_roles and not await self._active(guild, "role_remove"):
+            removed_roles = set()
         for role in removed_roles:
             entry = await self._get_audit_log_entry(guild, discord.AuditLogAction.member_role_update, target_id=after.id)
             moderator = entry.user if entry else None
@@ -840,6 +970,8 @@ class AdminProtocol(commands.Cog):
     @commands.Cog.listener()
     async def on_guild_channel_create(self, channel: discord.abc.GuildChannel):
         guild = channel.guild
+        if not await self._active(guild, "channel_create"):
+            return
         lang = await self.config.guild(guild).language()
         # Resolve the acting moderator from the audit log (may be None).
         entry = await self._get_audit_log_entry(guild, discord.AuditLogAction.channel_create, target_id=channel.id)
@@ -866,6 +998,8 @@ class AdminProtocol(commands.Cog):
     @commands.Cog.listener()
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
         guild = channel.guild
+        if not await self._active(guild, "channel_delete"):
+            return
         lang = await self.config.guild(guild).language()
         # BUGFIX: resolve WHICH moderator deleted the channel via the audit log
         # (gracefully "Unknown" when View Audit Log is missing).
@@ -898,6 +1032,8 @@ class AdminProtocol(commands.Cog):
     @commands.Cog.listener()
     async def on_guild_channel_update(self, before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
         guild = after.guild
+        if not await self._active(guild, "channel_update"):
+            return
         lang = await self.config.guild(guild).language()
         entry = await self._get_audit_log_entry(guild, discord.AuditLogAction.channel_update, target_id=after.id)
         moderator = entry.user if entry else None
@@ -932,6 +1068,8 @@ class AdminProtocol(commands.Cog):
     @commands.Cog.listener()
     async def on_thread_create(self, thread: discord.Thread):
         guild = thread.guild
+        if not await self._active(guild, "thread_create"):
+            return
         lang = await self.config.guild(guild).language()
         # Thread creator is available directly on the thread object.
         creator = guild.get_member(thread.owner_id) if thread.owner_id else None
@@ -957,6 +1095,8 @@ class AdminProtocol(commands.Cog):
     @commands.Cog.listener()
     async def on_thread_delete(self, thread: discord.Thread):
         guild = thread.guild
+        if not await self._active(guild, "thread_delete"):
+            return
         lang = await self.config.guild(guild).language()
         # Resolve the acting moderator from the audit log (may be None).
         entry = await self._get_audit_log_entry(guild, discord.AuditLogAction.thread_delete, target_id=thread.id)
@@ -983,6 +1123,8 @@ class AdminProtocol(commands.Cog):
     @commands.Cog.listener()
     async def on_thread_update(self, before: discord.Thread, after: discord.Thread):
         guild = after.guild
+        if not await self._active(guild, "thread_update"):
+            return
         lang = await self.config.guild(guild).language()
         entry = await self._get_audit_log_entry(guild, discord.AuditLogAction.thread_update, target_id=after.id)
         moderator = entry.user if entry else None
@@ -1017,6 +1159,8 @@ class AdminProtocol(commands.Cog):
     @commands.Cog.listener()
     async def on_guild_role_create(self, role: discord.Role):
         guild = role.guild
+        if not await self._active(guild, "role_create"):
+            return
         lang = await self.config.guild(guild).language()
         # Resolve the acting moderator from the audit log (may be None).
         entry = await self._get_audit_log_entry(guild, discord.AuditLogAction.role_create, target_id=role.id)
@@ -1041,6 +1185,8 @@ class AdminProtocol(commands.Cog):
     @commands.Cog.listener()
     async def on_guild_role_delete(self, role: discord.Role):
         guild = role.guild
+        if not await self._active(guild, "role_delete"):
+            return
         lang = await self.config.guild(guild).language()
         # Resolve the acting moderator from the audit log (may be None).
         entry = await self._get_audit_log_entry(guild, discord.AuditLogAction.role_delete, target_id=role.id)
@@ -1068,6 +1214,10 @@ class AdminProtocol(commands.Cog):
         if not guild:
             return
 
+        if not await self._active(guild, "invite_create"):
+
+            return
+
         lang = await self.config.guild(guild).language()
         expire_str = format_duration(invite.max_age, lang) if invite.max_age > 0 else tr_lang(lang, "Niemals", "Never")
 
@@ -1092,6 +1242,8 @@ class AdminProtocol(commands.Cog):
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
         guild = member.guild
+        if not await self._active(guild, "voice_join", "voice_disconnect", "voice_leave", "voice_move", "voice_switch", "voice_status"):
+            return
         lang = await self.config.guild(guild).language()
 
         # 1. Joined voice channel
@@ -1108,8 +1260,10 @@ class AdminProtocol(commands.Cog):
         # 2. Left voice channel
         elif before.channel is not None and after.channel is None:
             # Check if disconnected by a moderator
-            entry = await self._get_audit_log_entry(guild, discord.AuditLogAction.member_disconnect, target_id=member.id)
-            if entry:
+            entry = None
+            if await self._active(guild, "voice_disconnect"):
+                entry = await self._voice_mod_entry(guild, discord.AuditLogAction.member_disconnect)
+            if entry and entry.user and entry.user.id != member.id:
                 # Disconnected by other
                 embed = discord.Embed(
                     color=0xe74c3c,
@@ -1140,9 +1294,11 @@ class AdminProtocol(commands.Cog):
         # 3. Switched voice channels / moved by moderator
         elif before.channel is not None and after.channel is not None and before.channel.id != after.channel.id:
             # Check if moved by moderator
-            entry = await self._get_audit_log_entry(guild, discord.AuditLogAction.member_move)
-            # In member_move audit logs, target is often None or the user. We check target_id.
-            if entry and entry.target and entry.target.id == member.id:
+            entry = None
+            if await self._active(guild, "voice_move"):
+                # member_move entries have no target: match by destination channel.
+                entry = await self._voice_mod_entry(guild, discord.AuditLogAction.member_move, channel_id=after.channel.id)
+            if entry and entry.user and entry.user.id != member.id:
                 # Moderator moved
                 embed = discord.Embed(
                     color=0xf1c40f,
@@ -1212,7 +1368,9 @@ class AdminProtocol(commands.Cog):
             await self._post_embed(guild, "voice_status", embed, channel=current_channel, member=member)
 
     @commands.Cog.listener()
-    async def on_command(self, ctx: commands.Context):
+    async def on_command_completion(self, ctx: commands.Context):
+        # Completion (not on_command): only commands that passed their checks
+        # and actually ran are logged.
         if not ctx.guild or ctx.command is None:
             return
         cog_name = ctx.cog.qualified_name if ctx.cog else None
@@ -1321,10 +1479,12 @@ class AdminProtocol(commands.Cog):
     @commands.hybrid_group(name="adminprotocol", aliases=["ap"])
     @commands.admin_or_permissions(manage_guild=True)
     @commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
     async def adminprotocol(self, ctx: commands.Context) -> None:
         """Configure and inspect AdminProtocol event logging."""
 
     @adminprotocol.command(name="status")
+    @commands.admin_or_permissions(manage_guild=True)
     async def ap_status(self, ctx: commands.Context) -> None:
         """Show all events with their state and log channel (paginated)."""
         lang = await self.config.guild(ctx.guild).language()
@@ -1354,6 +1514,7 @@ class AdminProtocol(commands.Cog):
 
     @adminprotocol.command(name="toggle")
     @app_commands.describe(event="Event key (see status)", on_off="Enable or disable this event")
+    @commands.admin_or_permissions(manage_guild=True)
     async def ap_toggle(self, ctx: commands.Context, event: str, on_off: bool) -> None:
         """Enable/disable a single event type."""
         lang = await self.config.guild(ctx.guild).language()
@@ -1373,6 +1534,7 @@ class AdminProtocol(commands.Cog):
 
     @adminprotocol.command(name="channel")
     @app_commands.describe(event="Event key (see status)", channel="Target log channel (omit to clear)")
+    @commands.admin_or_permissions(manage_guild=True)
     async def ap_channel(
         self, ctx: commands.Context, event: str, channel: Optional[discord.TextChannel] = None
     ) -> None:
@@ -1397,6 +1559,7 @@ class AdminProtocol(commands.Cog):
 
     @adminprotocol.command(name="language")
     @app_commands.describe(language="Output language: de-DE or en-US")
+    @commands.admin_or_permissions(manage_guild=True)
     async def ap_language(self, ctx: commands.Context, language: str) -> None:
         """Set the output language for this server (default: en-US)."""
         language = "de-DE" if language.lower().startswith("de") else "en-US"
@@ -1409,6 +1572,7 @@ class AdminProtocol(commands.Cog):
         member="Optional member filter (subject or moderator)",
         minutes="Only entries from the last X minutes",
     )
+    @commands.admin_or_permissions(manage_guild=True)
     async def ap_recent(
         self,
         ctx: commands.Context,
@@ -1696,7 +1860,7 @@ class AdminProtocol(commands.Cog):
                 
                 # Channel dropdown options with selected pre-selected channel
                 current_ch_id = ev_data.get("channel")
-                ch_select_options = [f'<option value="">-- Deaktiviert --</option>']
+                ch_select_options = ['<option value="">-- Deaktiviert --</option>']
                 for ch in text_channels:
                     selected = "selected" if ch.id == current_ch_id else ""
                     ch_select_options.append(f'<option value="{ch.id}" {selected}>#{html.escape(ch.name)} ({ch.id})</option>')
@@ -1885,7 +2049,7 @@ function renderTags(ev, type) {{
     const hiddenInput = document.getElementById(`ignored_${{type}}s_${{ev}}`);
     if (!container || !hiddenInput) return;
 
-    container.innerHTML = "";
+    container.replaceChildren();
     const list = tagData[ev][type];
     hiddenInput.value = list.join(",");
 
@@ -1895,9 +2059,15 @@ function renderTags(ev, type) {{
         if (type === 'role') name = roleNames[id] || `Rolle #${{id}}`;
         if (type === 'user') name = userNames[id] || `Benutzer #${{id}}`;
 
+        // Build via DOM + textContent: names (nicknames!) are user-controlled.
         const tag = document.createElement("span");
         tag.className = "tag";
-        tag.innerHTML = `${{name}} <span class="remove" onclick="removeTag('${{ev}}', '${{type}}', '${{id}}')">&times;</span>`;
+        tag.appendChild(document.createTextNode(String(name) + " "));
+        const rm = document.createElement("span");
+        rm.className = "remove";
+        rm.textContent = "\u00d7";
+        rm.addEventListener("click", () => removeTag(ev, type, id));
+        tag.appendChild(rm);
         container.appendChild(tag);
     }});
 }}

@@ -51,21 +51,31 @@ def xp_for_level(level: int) -> int:
 
 
 def total_xp_for_level(level: int) -> int:
-    """Cumulative XP required to *reach* ``level`` from zero."""
-    total = 0
-    for lvl in range(level):
-        total += xp_for_level(lvl)
-    return total
+    """Cumulative XP required to *reach* ``level`` from zero (closed form of
+    sum(5l^2 + 50l + 100) for l in 0..level-1)."""
+    n = max(0, int(level))
+    return 5 * (n - 1) * n * (2 * n - 1) // 6 + 25 * n * (n - 1) + 100 * n
 
 
 def level_from_xp(total_xp: int) -> int:
-    """Level reached with ``total_xp`` cumulative XP."""
-    level = 0
-    remaining = int(total_xp)
-    while remaining >= xp_for_level(level):
-        remaining -= xp_for_level(level)
-        level += 1
-    return level
+    """Level reached with ``total_xp`` cumulative XP (binary search, O(log n))."""
+    xp = max(0, int(total_xp))
+    lo, hi = 0, 1
+    while total_xp_for_level(hi) <= xp:
+        lo, hi = hi, hi * 2
+    # invariant: total_xp_for_level(lo) <= xp < total_xp_for_level(hi)
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if total_xp_for_level(mid) <= xp:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+MAX_LEVEL = 1000
+MAX_XP_PER_COMMAND = 10_000_000  # upper bound for addxp/removexp
+MAX_TOTAL_XP = total_xp_for_level(MAX_LEVEL)  # stored XP is clamped to this
 
 
 class _ConfirmView(discord.ui.View):
@@ -199,7 +209,7 @@ class Leveling(commands.Cog):
         """Add XP to a member, update the level and handle level-up effects."""
         async with self._lock(member.guild.id):
             mconf = self.config.member(member)
-            xp = max(0, int(await mconf.xp()) + int(amount))
+            xp = min(MAX_TOTAL_XP, max(0, int(await mconf.xp()) + int(amount)))
             old_level = int(await mconf.level())
             new_level = level_from_xp(xp)
             await mconf.xp.set(xp)
@@ -464,11 +474,13 @@ class Leveling(commands.Cog):
     @commands.hybrid_group(name="levelset", aliases=["lvlset"])
     @commands.admin_or_permissions(manage_guild=True)
     @commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
     async def levelset(self, ctx: commands.Context) -> None:
         """Configure the leveling module."""
 
     @levelset.command(name="enable")
     @app_commands.describe(on_off="Enable or disable leveling")
+    @commands.admin_or_permissions(manage_guild=True)
     async def levelset_enable(self, ctx: commands.Context, on_off: bool) -> None:
         """Enable/disable the module for this server."""
         lang = await self._lang(ctx.guild)
@@ -478,6 +490,7 @@ class Leveling(commands.Cog):
 
     @levelset.command(name="xp")
     @app_commands.describe(minimum="Minimum XP per message", maximum="Maximum XP per message")
+    @commands.admin_or_permissions(manage_guild=True)
     async def levelset_xp(self, ctx: commands.Context, minimum: int, maximum: int) -> None:
         """Set the XP range awarded per counted message."""
         lang = await self._lang(ctx.guild)
@@ -494,6 +507,7 @@ class Leveling(commands.Cog):
 
     @levelset.command(name="cooldown")
     @app_commands.describe(seconds="Seconds between counted messages (0 = no cooldown)")
+    @commands.admin_or_permissions(manage_guild=True)
     async def levelset_cooldown(self, ctx: commands.Context, seconds: int) -> None:
         """Set the per-member message XP cooldown."""
         lang = await self._lang(ctx.guild)
@@ -505,6 +519,7 @@ class Leveling(commands.Cog):
 
     @levelset.command(name="voicexp")
     @app_commands.describe(amount="XP per minute in voice (0 disables voice XP)")
+    @commands.admin_or_permissions(manage_guild=True)
     async def levelset_voicexp(self, ctx: commands.Context, amount: int) -> None:
         """Set the XP awarded per minute in voice channels."""
         lang = await self._lang(ctx.guild)
@@ -521,6 +536,7 @@ class Leveling(commands.Cog):
     @app_commands.describe(
         muted="Ignore muted members", deafened="Ignore deafened members", alone="Ignore members who are alone"
     )
+    @commands.admin_or_permissions(manage_guild=True)
     async def levelset_voiceignore(
         self, ctx: commands.Context, muted: bool, deafened: bool, alone: bool
     ) -> None:
@@ -541,6 +557,7 @@ class Leveling(commands.Cog):
         mode="off, current (same channel) or channel (fixed channel)",
         channel="Fixed announcement channel (for mode 'channel')",
     )
+    @commands.admin_or_permissions(manage_guild=True)
     async def levelset_announce(
         self, ctx: commands.Context, mode: str, channel: Optional[discord.TextChannel] = None
     ) -> None:
@@ -570,6 +587,7 @@ class Leveling(commands.Cog):
 
     @levelset.command(name="message")
     @app_commands.describe(text="Message template — {member} and {level} are replaced")
+    @commands.admin_or_permissions(manage_guild=True)
     async def levelset_message(self, ctx: commands.Context, *, text: str) -> None:
         """Set the level-up message template."""
         lang = await self._lang(ctx.guild)
@@ -578,6 +596,7 @@ class Leveling(commands.Cog):
 
     @levelset.command(name="stack")
     @app_commands.describe(on_off="True = stack reward roles, False = keep only the highest")
+    @commands.admin_or_permissions(manage_guild=True)
     async def levelset_stack(self, ctx: commands.Context, on_off: bool) -> None:
         """Choose whether reward roles stack or replace each other."""
         lang = await self._lang(ctx.guild)
@@ -590,6 +609,7 @@ class Leveling(commands.Cog):
 
     @levelset.command(name="language")
     @app_commands.describe(language="Output language: de-DE or en-US")
+    @commands.admin_or_permissions(manage_guild=True)
     async def levelset_language(self, ctx: commands.Context, language: str) -> None:
         """Set the output language for this server."""
         language = "de-DE" if language.lower().startswith("de") else "en-US"
@@ -597,6 +617,7 @@ class Leveling(commands.Cog):
         await ctx.send(self._t(language, "Sprache: Deutsch", "Language: English"))
 
     @levelset.command(name="settings")
+    @commands.admin_or_permissions(manage_guild=True)
     async def levelset_settings(self, ctx: commands.Context) -> None:
         """Show the current leveling configuration."""
         lang = await self._lang(ctx.guild)
@@ -627,11 +648,13 @@ class Leveling(commands.Cog):
 
     # --- role rewards --------------------------------------------------- #
     @levelset.group(name="reward")
+    @commands.admin_or_permissions(manage_guild=True)
     async def levelset_reward(self, ctx: commands.Context) -> None:
         """Manage level → role rewards."""
 
     @levelset_reward.command(name="add")
     @app_commands.describe(level="Level at which the role is granted", role="Role to grant")
+    @commands.admin_or_permissions(manage_guild=True)
     async def reward_add(self, ctx: commands.Context, level: int, role: discord.Role) -> None:
         """Add or update a role reward for a level."""
         lang = await self._lang(ctx.guild)
@@ -655,6 +678,7 @@ class Leveling(commands.Cog):
 
     @levelset_reward.command(name="remove")
     @app_commands.describe(level="Level whose reward should be removed")
+    @commands.admin_or_permissions(manage_guild=True)
     async def reward_remove(self, ctx: commands.Context, level: int) -> None:
         """Remove the role reward for a level."""
         lang = await self._lang(ctx.guild)
@@ -667,6 +691,7 @@ class Leveling(commands.Cog):
                                    f"Reward for level **{level}** removed."))
 
     @levelset_reward.command(name="list")
+    @commands.admin_or_permissions(manage_guild=True)
     async def reward_list(self, ctx: commands.Context) -> None:
         """List all role rewards."""
         lang = await self._lang(ctx.guild)
@@ -686,11 +711,13 @@ class Leveling(commands.Cog):
 
     # --- no-XP lists ----------------------------------------------------- #
     @levelset.group(name="noxp")
+    @commands.admin_or_permissions(manage_guild=True)
     async def levelset_noxp(self, ctx: commands.Context) -> None:
         """Manage no-XP channels and roles."""
 
     @levelset_noxp.command(name="channel")
     @app_commands.describe(channel="Channel to toggle on the no-XP list")
+    @commands.admin_or_permissions(manage_guild=True)
     async def noxp_channel(self, ctx: commands.Context, channel: discord.abc.GuildChannel) -> None:
         """Toggle a channel on the no-XP list."""
         lang = await self._lang(ctx.guild)
@@ -710,6 +737,7 @@ class Leveling(commands.Cog):
 
     @levelset_noxp.command(name="role")
     @app_commands.describe(role="Role to toggle on the no-XP list")
+    @commands.admin_or_permissions(manage_guild=True)
     async def noxp_role(self, ctx: commands.Context, role: discord.Role) -> None:
         """Toggle a role on the no-XP list."""
         lang = await self._lang(ctx.guild)
@@ -730,11 +758,16 @@ class Leveling(commands.Cog):
     # --- XP management ---------------------------------------------------- #
     @levelset.command(name="addxp")
     @app_commands.describe(member="Member to grant XP to", amount="Amount of XP to add")
+    @commands.admin_or_permissions(manage_guild=True)
     async def levelset_addxp(self, ctx: commands.Context, member: discord.Member, amount: int) -> None:
         """Add XP to a member."""
         lang = await self._lang(ctx.guild)
-        if member.bot or amount <= 0:
-            await ctx.send(self._t(lang, "Ungültige Eingabe.", "Invalid input."))
+        if member.bot or not 0 < amount <= MAX_XP_PER_COMMAND:
+            await ctx.send(self._t(
+                lang,
+                f"Ungültige Eingabe (1–{MAX_XP_PER_COMMAND:,} XP).",
+                f"Invalid input (1–{MAX_XP_PER_COMMAND:,} XP).",
+            ))
             return
         gconf = await self.config.guild(ctx.guild).all()
         await self._add_xp(member, amount, gconf, ctx.channel)
@@ -747,11 +780,16 @@ class Leveling(commands.Cog):
 
     @levelset.command(name="removexp")
     @app_commands.describe(member="Member to remove XP from", amount="Amount of XP to remove")
+    @commands.admin_or_permissions(manage_guild=True)
     async def levelset_removexp(self, ctx: commands.Context, member: discord.Member, amount: int) -> None:
         """Remove XP from a member."""
         lang = await self._lang(ctx.guild)
-        if member.bot or amount <= 0:
-            await ctx.send(self._t(lang, "Ungültige Eingabe.", "Invalid input."))
+        if member.bot or not 0 < amount <= MAX_XP_PER_COMMAND:
+            await ctx.send(self._t(
+                lang,
+                f"Ungültige Eingabe (1–{MAX_XP_PER_COMMAND:,} XP).",
+                f"Invalid input (1–{MAX_XP_PER_COMMAND:,} XP).",
+            ))
             return
         gconf = await self.config.guild(ctx.guild).all()
         await self._add_xp(member, -amount, gconf, None)
@@ -764,10 +802,11 @@ class Leveling(commands.Cog):
 
     @levelset.command(name="setlevel")
     @app_commands.describe(member="Member to set the level for", level="Target level")
+    @commands.admin_or_permissions(manage_guild=True)
     async def levelset_setlevel(self, ctx: commands.Context, member: discord.Member, level: int) -> None:
         """Set a member's level directly (XP is set to the level floor)."""
         lang = await self._lang(ctx.guild)
-        if member.bot or not 0 <= level <= 1000:
+        if member.bot or not 0 <= level <= MAX_LEVEL:
             await ctx.send(self._t(lang, "Level muss 0–1000 sein.", "Level must be 0–1000."))
             return
         target_xp = total_xp_for_level(level)
@@ -784,6 +823,7 @@ class Leveling(commands.Cog):
 
     @levelset.command(name="reset")
     @app_commands.describe(member="Member to reset (leave empty to reset the whole server)")
+    @commands.admin_or_permissions(manage_guild=True)
     async def levelset_reset(self, ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
         """Reset a member's XP, or the whole server's XP (with confirmation)."""
         lang = await self._lang(ctx.guild)

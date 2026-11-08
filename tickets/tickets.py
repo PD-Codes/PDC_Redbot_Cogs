@@ -16,11 +16,13 @@ from __future__ import annotations
 import asyncio
 import datetime
 import html as html_mod
+import io
+import json
 import logging
 import time
 import uuid
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import discord
 from discord import app_commands
@@ -54,6 +56,8 @@ _OPEN_ID = "pdc_ticket_open"
 _CLOSE_ID = "pdc_ticket_close"
 _CLAIM_ID = "pdc_ticket_claim"
 
+THREAD_SUPPORT_ADD_CAP = 25  # max support members added to a private ticket thread
+
 _DEFAULT_WELCOME = (
     "Hello {user}, thanks for opening a ticket about **{subject}**!\n"
     "Please describe your issue — the support team will be with you shortly."
@@ -67,6 +71,9 @@ class PanelView(discord.ui.View):
         super().__init__(timeout=None)
         self.cog = cog
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await self.cog._interaction_allowed(interaction)
+
     @discord.ui.button(label="🎫 Open ticket", style=discord.ButtonStyle.primary, custom_id=_OPEN_ID)
     async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.cog._handle_open(interaction)
@@ -78,6 +85,9 @@ class TicketView(discord.ui.View):
     def __init__(self, cog: "Tickets") -> None:
         super().__init__(timeout=None)
         self.cog = cog
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await self.cog._interaction_allowed(interaction)
 
     @discord.ui.button(label="🔒 Close", style=discord.ButtonStyle.danger, custom_id=_CLOSE_ID)
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -97,6 +107,9 @@ class ConfirmCloseView(discord.ui.View):
         self.user_id = user_id
         self.confirm.label = tr_lang(lang, "✅ Schließen bestätigen", "✅ Confirm close")
         self.cancel.label = tr_lang(lang, "Abbrechen", "Cancel")
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await self.cog._interaction_allowed(interaction)
 
     @discord.ui.button(style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -141,6 +154,8 @@ class Tickets(commands.Cog):
         self._panel_view: Optional[PanelView] = None
         self._ticket_view: Optional[TicketView] = None
         self._task: Optional[asyncio.Task] = None
+        # Per-guild lock: limit check + number allocation + record are atomic.
+        self._open_locks: Dict[int, asyncio.Lock] = {}
 
     async def cog_load(self) -> None:
         register_dashboard(self)
@@ -188,7 +203,10 @@ class Tickets(commands.Cog):
             for t in gdata.get("tickets", []):
                 if user_id in (t.get("opener"), t.get("claimer")):
                     found.append({"guild": gid, **t})
-        return {"tickets": found}
+        if not found:
+            return {}
+        payload = json.dumps({"tickets": found}, indent=2, ensure_ascii=False, default=str).encode("utf-8")
+        return {"tickets.json": io.BytesIO(payload)}
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -197,6 +215,58 @@ class Tickets(commands.Cog):
         if guild is None:
             return "en-US"
         return await self.config.guild(guild).language()
+
+    async def _interaction_allowed(self, interaction: discord.Interaction) -> bool:
+        """Honor Red's allow/blocklists, ignored channels and disabled cogs."""
+        guild = interaction.guild
+        try:
+            allowed = (
+                guild is not None
+                and not await self.bot.cog_disabled_in_guild(self, guild)
+                and await self.bot.allowed_by_whitelist_blacklist(interaction.user)
+                and await self.bot.ignored_channel_or_guild(interaction)
+            )
+        except Exception:
+            log.debug("Tickets: interaction check failed", exc_info=True)
+            allowed = False
+        if not allowed and not interaction.response.is_done():
+            try:
+                await interaction.response.send_message("⛔", ephemeral=True)
+            except discord.HTTPException:
+                pass
+        return allowed
+
+    async def _channel_exists(self, guild: discord.Guild, channel_id: int) -> bool:
+        """True if the ticket channel/thread still exists (archived threads included)."""
+        if not channel_id:
+            return False
+        if guild.get_channel_or_thread(channel_id) is not None:
+            return True
+        try:
+            await self.bot.fetch_channel(channel_id)  # archived threads are not cached
+            return True
+        except discord.NotFound:
+            return False
+        except discord.HTTPException:
+            return True  # unknown (e.g. no access): keep counting it
+
+    async def _mark_channel_deleted(self, guild: discord.Guild, channel_id: int) -> None:
+        """Mark the ticket bound to a deleted channel/thread as deleted."""
+        async with self.config.guild(guild).tickets() as tickets:
+            for t in tickets:
+                if t.get("channel") == channel_id and t.get("status") in ("open", "closed"):
+                    t["status"] = "deleted"
+                    t["closed"] = t.get("closed") or time.time()
+
+    @commands.Cog.listener()
+    async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
+        await self._mark_channel_deleted(channel.guild, channel.id)
+
+    @commands.Cog.listener()
+    async def on_raw_thread_delete(self, payload: discord.RawThreadDeleteEvent) -> None:
+        guild = self.bot.get_guild(payload.guild_id)
+        if guild is not None:
+            await self._mark_channel_deleted(guild, payload.thread_id)
 
     def _is_support(self, member: discord.Member, support_roles: List[int]) -> bool:
         """Support = has one of the support roles or manage_guild permission."""
@@ -262,26 +332,32 @@ class Tickets(commands.Cog):
                 ephemeral=True,
             )
             return
-        # Enforce the per-user open ticket limit.
-        max_open = max(1, int(gconf.get("max_open") or 3))
-        open_count = sum(
-            1
-            for t in gconf.get("tickets", [])
-            if t.get("opener") == interaction.user.id and t.get("status") == "open"
-        )
-        if open_count >= max_open:
-            await interaction.response.send_message(
-                tr_lang(
-                    lang,
-                    f"Du hast bereits **{open_count}** offene Tickets (Maximum: {max_open}).",
-                    f"You already have **{open_count}** open tickets (maximum: {max_open}).",
-                ),
-                ephemeral=True,
-            )
-            return
         await interaction.response.defer(ephemeral=True)
+        lock = self._open_locks.setdefault(guild.id, asyncio.Lock())
         try:
-            ticket = await self._create_ticket(interaction, panel, gconf, lang)
+            async with lock:
+                # Enforce the per-user open ticket limit (only tickets whose
+                # channel/thread still exists count) under the same lock that
+                # allocates the number and stores the record.
+                max_open = max(1, int(gconf.get("max_open") or 3))
+                open_count = 0
+                for t in await self.config.guild(guild).tickets():
+                    if t.get("opener") == interaction.user.id and t.get("status") == "open":
+                        if await self._channel_exists(guild, t.get("channel") or 0):
+                            open_count += 1
+                        else:
+                            await self._mark_channel_deleted(guild, t.get("channel") or 0)
+                if open_count >= max_open:
+                    await interaction.followup.send(
+                        tr_lang(
+                            lang,
+                            f"Du hast bereits **{open_count}** offene Tickets (Maximum: {max_open}).",
+                            f"You already have **{open_count}** open tickets (maximum: {max_open}).",
+                        ),
+                        ephemeral=True,
+                    )
+                    return
+                ticket = await self._create_ticket(interaction, panel, gconf, lang)
         except discord.Forbidden:
             await interaction.followup.send(
                 tr_lang(
@@ -317,7 +393,7 @@ class Tickets(commands.Cog):
         support_roles = [guild.get_role(r) for r in gconf.get("support_roles", [])]
         support_roles = [r for r in support_roles if r is not None]
 
-        # Allocate the next ticket number.
+        # Allocate the next ticket number (caller holds the per-guild open lock).
         number = int(await self.config.guild(guild).next_ticket())
         await self.config.guild(guild).next_ticket.set(number + 1)
         name = f"ticket-{number:04d}"
@@ -331,6 +407,22 @@ class Tickets(commands.Cog):
                 reason=f"Ticket #{number:04d} by {opener}",
             )
             await thread.add_user(opener)
+            # Role mentions only pull members into a private thread when the
+            # role is mentionable; add support members explicitly (capped).
+            added = 0
+            seen_ids = {opener.id}
+            for role in support_roles:
+                for member in role.members:
+                    if added >= THREAD_SUPPORT_ADD_CAP:
+                        break
+                    if member.bot or member.id in seen_ids:
+                        continue
+                    seen_ids.add(member.id)
+                    try:
+                        await thread.add_user(member)
+                        added += 1
+                    except discord.HTTPException:
+                        log.debug("Could not add %s to ticket thread", member.id, exc_info=True)
             target = thread
         else:
             category = guild.get_channel(gconf.get("ticket_category") or 0)
@@ -656,6 +748,10 @@ class Tickets(commands.Cog):
                 "Only the opener or support staff can close this ticket.",
             ))
             return
+        if ctx.interaction is not None:
+            # Answer the slash interaction before the (slow) transcript and
+            # before the thread gets archived/locked.
+            await ctx.send(tr_lang(lang, "Schließe Ticket…", "Closing ticket…"), ephemeral=True)
         await self._close_ticket(ctx.guild, ctx.channel, t, closer=ctx.author, lang=lang)
 
     @ticket.command(name="claim")
@@ -807,6 +903,34 @@ class Tickets(commands.Cog):
             f"Panel erstellt in {channel.mention} (ID `{panel['id']}`).",
             f"Panel created in {channel.mention} (ID `{panel['id']}`).",
         ))
+        warning = await self._thread_role_warning(ctx.guild, lang)
+        if warning:
+            await ctx.send(warning)
+
+    async def _thread_role_warning(self, guild: discord.Guild, lang: str) -> Optional[str]:
+        """Warn when support roles may not be pulled into private ticket threads."""
+        conf = self.config.guild(guild)
+        if not await conf.use_threads():
+            return None
+        if guild.me.guild_permissions.mention_everyone:
+            return None
+        roles = [guild.get_role(r) for r in await conf.support_roles()]
+        problems = [
+            r for r in roles
+            if r is not None and not r.mentionable and len(r.members) > THREAD_SUPPORT_ADD_CAP
+        ]
+        if not problems:
+            return None
+        names = ", ".join(r.name for r in problems)
+        return tr_lang(
+            lang,
+            f"⚠️ Thread-Modus: Die Support-Rolle(n) {names} sind nicht erwähnbar und haben mehr als "
+            f"{THREAD_SUPPORT_ADD_CAP} Mitglieder – nicht alle werden in Ticket-Threads aufgenommen. "
+            "Rolle erwähnbar machen oder dem Bot „@everyone erwähnen“ erlauben.",
+            f"⚠️ Thread mode: the support role(s) {names} are not mentionable and have more than "
+            f"{THREAD_SUPPORT_ADD_CAP} members – not all of them will be added to ticket threads. "
+            "Make the role mentionable or grant the bot \"Mention @everyone\".",
+        )
 
     @ticketset.command(name="panels")
     async def ts_panels(self, ctx: commands.Context) -> None:

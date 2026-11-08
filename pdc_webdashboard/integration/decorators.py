@@ -5,7 +5,6 @@ method; collecting them is done by the registry when the cog is registered.
 """
 from __future__ import annotations
 
-import functools
 from typing import Any, Callable, List, Optional
 
 WIDGET_ATTR = "__dashboard_widget__"

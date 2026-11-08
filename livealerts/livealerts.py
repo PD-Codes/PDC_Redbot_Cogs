@@ -310,6 +310,8 @@ class LiveAlerts(commands.Cog):
             guild = self.bot.get_guild(gid)
             if guild is None:
                 continue
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                continue
             subs = gconf.get("subs") or {}
             if not subs:
                 continue
@@ -360,6 +362,14 @@ class LiveAlerts(commands.Cog):
                 return f"{role.mention} "
         return ""
 
+    def _allowed_mentions(self, guild: discord.Guild, sub: dict) -> discord.AllowedMentions:
+        """Only the configured ping role may be mentioned (no @everyone/users)."""
+        role_id = sub.get("role")
+        role = guild.get_role(int(role_id)) if role_id else None
+        return discord.AllowedMentions(
+            everyone=False, users=False, roles=[role] if role is not None else False
+        )
+
     async def _process_twitch(self, guild: discord.Guild, sub: dict, live_map: Optional[Dict[str, dict]]) -> dict:
         sub["last_fetch"] = time.time()
         if live_map is None:
@@ -409,7 +419,9 @@ class LiveAlerts(commands.Cog):
             # Cache-bust the thumbnail so Discord shows a fresh preview.
             embed.set_image(url=f"{thumb}?t={int(time.time())}")
         try:
-            msg = await channel.send(content=content, embed=embed)
+            msg = await channel.send(
+                content=content, embed=embed, allowed_mentions=self._allowed_mentions(guild, sub)
+            )
             sub["live_message"] = {"channel": channel.id, "message": msg.id}
         except discord.HTTPException:
             log.warning("LiveAlerts: sending Twitch alert to #%s failed", getattr(channel, "name", "?"), exc_info=True)
@@ -462,7 +474,7 @@ class LiveAlerts(commands.Cog):
                     streamer=str(streamer), title=e["title"], url=e["url"], game="",
                 )
                 try:
-                    await channel.send(content=content)
+                    await channel.send(content=content, allowed_mentions=self._allowed_mentions(guild, sub))
                 except discord.HTTPException:
                     log.warning("LiveAlerts: sending YouTube alert failed", exc_info=True)
 

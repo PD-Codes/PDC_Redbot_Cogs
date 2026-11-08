@@ -10,8 +10,11 @@ suggestion list page) via the resilient drop-in.
 """
 from __future__ import annotations
 
+import asyncio
+import io
+import json
 import logging
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import discord
 from discord import app_commands
@@ -84,6 +87,8 @@ class Suggestions(commands.Cog):
             # suggestion: {id, author, text, message, channel, status, reason}
             suggestions=[],
         )
+        # Per-guild lock so suggestion numbers are handed out atomically.
+        self._id_locks: Dict[int, asyncio.Lock] = {}
 
     async def cog_load(self) -> None:
         register_dashboard(self)
@@ -107,16 +112,20 @@ class Suggestions(commands.Cog):
 
     async def red_get_data_for_user(self, *, user_id: int) -> dict:
         """Return the user's stored suggestions."""
-        lines: List[str] = []
+        found: List[dict] = []
         for guild_id, data in (await self.config.all_guilds()).items():
             for s in data.get("suggestions") or []:
                 if s.get("author") == user_id:
-                    lines.append(
-                        f"guild {guild_id}: #{s.get('id')} [{s.get('status')}] {s.get('text', '')}"
-                    )
-        if not lines:
+                    found.append({
+                        "guild_id": guild_id,
+                        "id": s.get("id"),
+                        "status": s.get("status"),
+                        "text": s.get("text", ""),
+                    })
+        if not found:
             return {}
-        return {"suggestions.txt": "\n".join(lines).encode("utf-8")}
+        payload = json.dumps({"suggestions": found}, indent=2, ensure_ascii=False).encode("utf-8")
+        return {"suggestions.json": io.BytesIO(payload)}
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -215,6 +224,7 @@ class Suggestions(commands.Cog):
     @app_commands.describe(text="Your suggestion")
     async def suggest(self, ctx: commands.Context, *, text: str) -> None:
         """Submit a suggestion."""
+        await ctx.defer(ephemeral=True)  # posting can exceed the 3 s interaction window
         lang = await self._lang(ctx.guild)
         conf = await self.config.guild(ctx.guild).all()
         if not conf.get("enabled", True):
@@ -228,8 +238,13 @@ class Suggestions(commands.Cog):
             await ctx.send(tr_lang(lang, "Bitte gib einen Text an.", "Please provide some text."), ephemeral=True)
             return
         review = bool(conf.get("review_mode")) and conf.get("review_channel")
+        # Reserve the number atomically (read + write under one per-guild lock).
+        lock = self._id_locks.setdefault(ctx.guild.id, asyncio.Lock())
+        async with lock:
+            new_id = int(await self.config.guild(ctx.guild).next_id() or 1)
+            await self.config.guild(ctx.guild).next_id.set(new_id + 1)
         s = {
-            "id": int(conf.get("next_id") or 1),
+            "id": new_id,
             "author": ctx.author.id,
             "text": text,
             "message": None,
@@ -265,7 +280,6 @@ class Suggestions(commands.Cog):
             s["channel"] = msg.channel.id
         async with self.config.guild(ctx.guild).suggestions() as suggestions:
             suggestions.append(s)
-        await self.config.guild(ctx.guild).next_id.set(s["id"] + 1)
         await ctx.send(
             tr_lang(
                 lang,

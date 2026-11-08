@@ -304,11 +304,13 @@ class ChannelJoinNotification(commands.Cog):
     @commands.hybrid_group(name="cjnset")
     @commands.guild_only()
     @commands.admin_or_permissions(manage_guild=True)
+    @app_commands.default_permissions(manage_guild=True)
     async def cjnset(self, ctx: commands.Context) -> None:
         """Configure channel join/leave notifications."""
 
     @cjnset.command(name="cooldown")
     @app_commands.describe(seconds="Per member+channel DM cooldown in seconds (0-3600)")
+    @commands.admin_or_permissions(manage_guild=True)
     async def cjn_cooldown(self, ctx: commands.Context, seconds: int) -> None:
         """Set the per-member+channel DM cooldown (spam guard)."""
         lang = await self.config.guild(ctx.guild).language()
@@ -322,6 +324,7 @@ class ChannelJoinNotification(commands.Cog):
         on_off="Enable or disable the leave DM",
         text="Optional leave DM text (placeholders: <Username>, <Channelname>)",
     )
+    @commands.admin_or_permissions(manage_guild=True)
     async def cjn_leave(
         self,
         ctx: commands.Context,
@@ -353,6 +356,7 @@ class ChannelJoinNotification(commands.Cog):
         ))
 
     @cjnset.command(name="list")
+    @commands.admin_or_permissions(manage_guild=True)
     async def cjn_list_cmd(self, ctx: commands.Context) -> None:
         """List all configured channel notifications (paginated)."""
         lang = await self.config.guild(ctx.guild).language()
@@ -397,6 +401,7 @@ class ChannelJoinNotification(commands.Cog):
 
     @cjnset.command(name="language")
     @app_commands.describe(language="Output language: de-DE or en-US")
+    @commands.admin_or_permissions(manage_guild=True)
     async def cjn_language(self, ctx: commands.Context, language: str) -> None:
         """Set the output language for this server."""
         language = "de-DE" if language.lower().startswith("de") else "en-US"
@@ -469,6 +474,8 @@ class ChannelJoinNotification(commands.Cog):
         if member.guild is None or member.bot:
             return
         if before.channel == after.channel:
+            return
+        if await self.bot.cog_disabled_in_guild(self, member.guild):
             return
 
         data = await self.config.guild(member.guild).notifications()

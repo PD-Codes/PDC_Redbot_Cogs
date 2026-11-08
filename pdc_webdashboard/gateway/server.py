@@ -83,8 +83,29 @@ class Gateway:
     # Runtime reconfiguration (owner commands)
     # ------------------------------------------------------------------ #
     def update_token(self, token: str) -> None:
-        """Apply a rotated token without restarting the gateway."""
+        """Apply a rotated token without restarting the gateway.
+
+        SECURITY: existing WebSockets authenticated with the OLD token are closed,
+        so clients must re-authenticate (connection_init) with the new one.
+        """
+        changed = token != self.token
         self.token = token
+        if changed and self._ws_clients:
+            try:
+                asyncio.get_running_loop().create_task(self._close_all_ws())
+            except RuntimeError:
+                pass  # no running loop (e.g. tests) – nothing connected then
+
+    async def _close_all_ws(self) -> None:
+        clients = list(self._ws_clients)
+        self._ws_clients.clear()
+        for subs in self._subscriptions.values():
+            subs.difference_update(clients)
+        for ws in clients:
+            try:
+                await ws.close(code=4001, message=b"token rotated")
+            except Exception:
+                pass
 
     def update_cors_origins(self, origins: Iterable[str]) -> None:
         """Apply a changed CORS allow-list without restarting the gateway."""
@@ -98,9 +119,9 @@ class Gateway:
     # Auth / CORS
     # ------------------------------------------------------------------ #
     def _check_token(self, provided: Optional[str]) -> bool:
-        if not provided or not self.token:
+        if not provided or not self.token or not isinstance(provided, str):
             return False
-        return hmac.compare_digest(provided, self.token)
+        return hmac.compare_digest(provided.encode("utf-8"), str(self.token).encode("utf-8"))
 
     def _cors_headers(self, request: web.Request) -> Dict[str, str]:
         """CORS headers for an allowed Origin; empty dict otherwise."""
@@ -229,11 +250,19 @@ class Gateway:
                     await ws.send_json({"jsonrpc": "2.0", "id": None,
                                         "error": {"code": -32700, "message": "parse error"}})
                     continue
+                if not isinstance(data, dict):
+                    await ws.send_json({"jsonrpc": "2.0", "id": None,
+                                        "error": {"code": -32600, "message": "invalid request"}})
+                    if not authenticated:
+                        await ws.close()
+                        break
+                    continue
 
                 # first frame must be connection_init with token
                 if not authenticated:
+                    init_params = data.get("params") if isinstance(data.get("params"), dict) else {}
                     if data.get("method") == "connection_init" and \
-                            self._check_token((data.get("params") or {}).get("token")):
+                            self._check_token(init_params.get("token")):
                         authenticated = True
                         await ws.send_json({"jsonrpc": "2.0", "id": data.get("id"),
                                             "result": {"ok": True}})
@@ -245,14 +274,15 @@ class Gateway:
 
                 # subscription control for push streams
                 method = data.get("method")
+                sub_params = data.get("params") if isinstance(data.get("params"), dict) else {}
                 if method == "subscribe":
-                    channel = (data.get("params") or {}).get("channel")
+                    channel = sub_params.get("channel")
                     self._subscriptions.setdefault(channel, set()).add(ws)
                     await ws.send_json({"jsonrpc": "2.0", "id": data.get("id"),
                                         "result": {"subscribed": channel}})
                     continue
                 if method == "unsubscribe":
-                    channel = (data.get("params") or {}).get("channel")
+                    channel = sub_params.get("channel")
                     self._subscriptions.get(channel, set()).discard(ws)
                     await ws.send_json({"jsonrpc": "2.0", "id": data.get("id"),
                                         "result": {"unsubscribed": channel}})

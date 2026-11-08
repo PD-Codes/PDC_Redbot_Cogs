@@ -13,9 +13,10 @@ import calendar
 import csv
 import datetime
 import io
+import json
 import logging
 import re
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 import discord
 from discord import app_commands
@@ -68,6 +69,32 @@ def _parse_date(text: str) -> Optional[str]:
     if not (1 <= dd <= max_day):
         return None
     return f"{mm:02d}-{dd:02d}"
+
+
+def _csv_safe(value) -> str:
+    """Neutralise spreadsheet formula injection in exported cells."""
+    text = "" if value is None else str(value)
+    if text and text[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + text
+    return text
+
+
+def _role_problem(guild: discord.Guild, role: discord.Role, lang: str) -> Optional[str]:
+    """Return an error text when `role` must not be used as birthday role."""
+    t = Birthday._t
+    if role.is_default():
+        return t(lang, "@everyone kann nicht verwendet werden.", "@everyone cannot be used.")
+    if role.managed:
+        return t(lang, "Verwaltete Rollen (Bots/Integrationen/Booster) sind nicht erlaubt.",
+                 "Managed roles (bots/integrations/boosters) are not allowed.")
+    if role.permissions.administrator:
+        return t(lang, "Rollen mit Administrator-Recht sind nicht erlaubt.",
+                 "Roles with the Administrator permission are not allowed.")
+    me = guild.me
+    if me is None or role >= me.top_role:
+        return t(lang, "Die Rolle liegt nicht unter der höchsten Rolle des Bots.",
+                 "The role is not below the bot's highest role.")
+    return None
 
 
 def _tzinfo(name: Optional[str]):
@@ -144,6 +171,9 @@ class Birthday(commands.Cog):
             feb29_mode="mar1",  # celebrate Feb-29 birthdays on "feb28" or "mar1"
             reminder_days=0,  # 0 = off; N = announce upcoming birthdays N days ahead
             last_reminder=None,  # "YYYY-MM-DD" guard for the reminder
+            # Members the bot itself gave the birthday role to; only these are
+            # ever un-assigned again: {"role": role_id, "members": [ids]}
+            role_holders={},
         )
         self.config.register_member(birthday=None)  # "MM-DD"
         self._task: Optional[asyncio.Task] = None
@@ -156,6 +186,32 @@ class Birthday(commands.Cog):
         unregister_dashboard(self)
         if self._task:
             self._task.cancel()
+
+    # ------------------------------------------------------------------ #
+    # Red end-user data API
+    # ------------------------------------------------------------------ #
+    async def red_delete_data_for_user(self, *, requester: str, user_id: int) -> None:
+        all_members = await self.config.all_members()
+        for gid, members in all_members.items():
+            if user_id in members:
+                await self.config.member_from_ids(gid, user_id).clear()
+        all_guilds = await self.config.all_guilds()
+        for gid, gconf in all_guilds.items():
+            holders = gconf.get("role_holders") or {}
+            if user_id in (holders.get("members") or []):
+                holders["members"] = [m for m in holders["members"] if m != user_id]
+                await self.config.guild_from_id(gid).role_holders.set(holders)
+
+    async def red_get_data_for_user(self, *, user_id: int) -> Dict[str, io.BytesIO]:
+        all_members = await self.config.all_members()
+        data = {
+            str(gid): {"birthday": members[user_id].get("birthday")}
+            for gid, members in all_members.items()
+            if user_id in members and members[user_id].get("birthday")
+        }
+        if not data:
+            return {}
+        return {"birthday.json": io.BytesIO(json.dumps(data, indent=2).encode("utf-8"))}
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -204,6 +260,8 @@ class Birthday(commands.Cog):
             guild = self.bot.get_guild(gid)
             if guild is None:
                 continue
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                continue
             try:
                 await self._tick_guild(guild, gconf)
             except Exception:
@@ -219,24 +277,13 @@ class Birthday(commands.Cog):
         members = await self.config.all_members(guild)
         today_ids = {mid for mid, mconf in members.items() if mconf.get("birthday") in today_keys}
 
-        # Keep the birthday role in sync (self-healing across restarts). Members
-        # whose birthday was yesterday are removed automatically here.
-        role_id = gconf.get("role")
-        role = guild.get_role(role_id) if role_id else None
-        if role is not None and guild.me.guild_permissions.manage_roles:
-            try:
-                for m in list(role.members):
-                    if m.id not in today_ids:
-                        await m.remove_roles(role, reason="Birthday over")
-                for mid in today_ids:
-                    m = guild.get_member(mid)
-                    if m is not None and role not in m.roles:
-                        await m.add_roles(role, reason="Birthday")
-            except discord.Forbidden:
-                pass
+        await self._sync_role(guild, gconf, today_ids)
 
-        # Announce once per day, at the configured guild-local hour.
-        if now_local.hour != int(gconf.get("hour", 9) or 9):
+        # Announce once per day, at (or - catching up after downtime - after)
+        # the configured guild-local hour. 0 is a valid hour.
+        hour = gconf.get("hour")
+        hour = 9 if hour is None else int(hour)
+        if now_local.hour < hour:
             return
         today_full = today.isoformat()
         lang = str(gconf.get("language") or "en-US")
@@ -280,6 +327,56 @@ class Birthday(commands.Cog):
                     ))
                 except discord.HTTPException:
                     pass
+
+    async def _sync_role(self, guild: discord.Guild, gconf: dict, today_ids: Set[int]) -> None:
+        """Keep the birthday role in sync (self-healing across restarts).
+
+        Only members the bot gave the role to itself (tracked in
+        ``role_holders``) are ever un-assigned; manually assigned holders of
+        the same role are left untouched."""
+        me = guild.me
+        if me is None or not me.guild_permissions.manage_roles:
+            return
+        role_id = gconf.get("role")
+        role = guild.get_role(role_id) if role_id else None
+        stored = gconf.get("role_holders") or {}
+        holders: Set[int] = set(stored.get("members") or [])
+        changed = False
+        if stored.get("role") != role_id:
+            # Role was changed/cleared: take the old role back from our holders.
+            old = guild.get_role(stored.get("role")) if stored.get("role") else None
+            if old is not None and old < me.top_role:
+                for mid in holders:
+                    m = guild.get_member(mid)
+                    if m is not None and old in m.roles:
+                        try:
+                            await m.remove_roles(old, reason="Birthday role changed")
+                        except discord.HTTPException:
+                            pass
+            holders = set()
+            changed = True
+        if role is not None and _role_problem(guild, role, "en-US") is None:
+            try:
+                for mid in list(holders):
+                    if mid in today_ids:
+                        continue
+                    m = guild.get_member(mid)
+                    if m is not None and role in m.roles:
+                        await m.remove_roles(role, reason="Birthday over")
+                    holders.discard(mid)
+                    changed = True
+                for mid in today_ids:
+                    m = guild.get_member(mid)
+                    if m is not None and role not in m.roles:
+                        await m.add_roles(role, reason="Birthday")
+                        holders.add(mid)
+                        changed = True
+            except discord.HTTPException:
+                pass
+        if changed:
+            await self.config.guild(guild).role_holders.set(
+                {"role": role_id, "members": sorted(holders)}
+            )
 
     # ------------------------------------------------------------------ #
     # User commands
@@ -356,11 +453,13 @@ class Birthday(commands.Cog):
     @commands.hybrid_group(name="birthdayset", aliases=["bdayset"])
     @commands.admin_or_permissions(manage_guild=True)
     @commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
     async def birthdayset(self, ctx: commands.Context) -> None:
         """Configure the birthday module."""
 
     @birthdayset.command(name="enable")
     @app_commands.describe(on_off="Enable or disable birthday announcements")
+    @commands.admin_or_permissions(manage_guild=True)
     async def birthdayset_enable(self, ctx: commands.Context, on_off: bool) -> None:
         """Enable/disable the module for this server."""
         lang = await self._lang(ctx.guild)
@@ -370,6 +469,7 @@ class Birthday(commands.Cog):
 
     @birthdayset.command(name="channel")
     @app_commands.describe(channel="Announcement channel")
+    @commands.admin_or_permissions(manage_guild=True)
     async def birthdayset_channel(self, ctx: commands.Context, channel: discord.TextChannel) -> None:
         """Set the announcement channel."""
         lang = await self._lang(ctx.guild)
@@ -378,6 +478,7 @@ class Birthday(commands.Cog):
 
     @birthdayset.command(name="role")
     @app_commands.describe(role="Birthday role (assigned on the day), or leave empty to clear")
+    @commands.admin_or_permissions(manage_guild=True)
     async def birthdayset_role(self, ctx: commands.Context, role: Optional[discord.Role] = None) -> None:
         """Set (or clear) the birthday role."""
         lang = await self._lang(ctx.guild)
@@ -385,11 +486,28 @@ class Birthday(commands.Cog):
             await self.config.guild(ctx.guild).role.clear()
             await ctx.send(self._t(lang, "Geburtstagsrolle entfernt.", "Birthday role cleared."))
             return
+        problem = _role_problem(ctx.guild, role, lang)
+        if problem is None and ctx.author.id != ctx.guild.owner_id and role >= ctx.author.top_role:
+            problem = self._t(lang, "Die Rolle liegt nicht unter deiner höchsten Rolle.",
+                              "The role is not below your highest role.")
+        if problem:
+            await ctx.send(problem, allowed_mentions=discord.AllowedMentions.none())
+            return
         await self.config.guild(ctx.guild).role.set(role.id)
-        await ctx.send(self._t(lang, f"Rolle: {role.mention}", f"Role: {role.mention}"))
+        msg = self._t(lang, f"Rolle: {role.mention}", f"Role: {role.mention}")
+        if role.members:
+            msg += "\n" + self._t(
+                lang,
+                f"⚠️ Die Rolle hat bereits **{len(role.members)}** Mitglied(er). Diese behalten sie; "
+                "der Bot entfernt die Rolle nur bei Mitgliedern, denen er sie selbst gegeben hat.",
+                f"⚠️ The role already has **{len(role.members)}** member(s). They keep it; "
+                "the bot only removes the role from members it assigned it to itself.",
+            )
+        await ctx.send(msg, allowed_mentions=discord.AllowedMentions.none())
 
     @birthdayset.command(name="hour")
     @app_commands.describe(hour="Guild-local hour (0-23) at which to announce")
+    @commands.admin_or_permissions(manage_guild=True)
     async def birthdayset_hour(self, ctx: commands.Context, hour: int) -> None:
         """Set the announcement hour (in the guild's timezone)."""
         lang = await self._lang(ctx.guild)
@@ -406,6 +524,7 @@ class Birthday(commands.Cog):
 
     @birthdayset.command(name="timezone", aliases=["tz"])
     @app_commands.describe(timezone="IANA timezone name, e.g. Europe/Berlin (default: UTC)")
+    @commands.admin_or_permissions(manage_guild=True)
     async def birthdayset_timezone(self, ctx: commands.Context, timezone: str) -> None:
         """Set the guild timezone (IANA name) used for announcements."""
         lang = await self._lang(ctx.guild)
@@ -427,6 +546,7 @@ class Birthday(commands.Cog):
 
     @birthdayset.command(name="feb29")
     @app_commands.describe(mode="When to celebrate Feb-29 birthdays in non-leap years: feb28 or mar1")
+    @commands.admin_or_permissions(manage_guild=True)
     async def birthdayset_feb29(self, ctx: commands.Context, mode: str) -> None:
         """Set how Feb-29 birthdays are handled in non-leap years."""
         lang = await self._lang(ctx.guild)
@@ -444,6 +564,7 @@ class Birthday(commands.Cog):
 
     @birthdayset.command(name="reminder")
     @app_commands.describe(days="Days of advance notice (0 disables the reminder)")
+    @commands.admin_or_permissions(manage_guild=True)
     async def birthdayset_reminder(self, ctx: commands.Context, days: int) -> None:
         """Announce upcoming birthdays N days in advance (0 = off)."""
         lang = await self._lang(ctx.guild)
@@ -462,6 +583,7 @@ class Birthday(commands.Cog):
 
     @birthdayset.command(name="message")
     @app_commands.describe(text="Message template — {mention} and {name} are replaced")
+    @commands.admin_or_permissions(manage_guild=True)
     async def birthdayset_message(self, ctx: commands.Context, *, text: str) -> None:
         """Set the announcement message template."""
         lang = await self._lang(ctx.guild)
@@ -470,6 +592,7 @@ class Birthday(commands.Cog):
 
     @birthdayset.command(name="language")
     @app_commands.describe(language="Output language: de-DE or en-US")
+    @commands.admin_or_permissions(manage_guild=True)
     async def birthdayset_language(self, ctx: commands.Context, language: str) -> None:
         """Set the output language for this server."""
         language = "de-DE" if language.lower().startswith("de") else "en-US"
@@ -477,6 +600,7 @@ class Birthday(commands.Cog):
         await ctx.send(self._t(language, "Sprache: Deutsch", "Language: English"))
 
     @birthdayset.command(name="export")
+    @commands.admin_or_permissions(manage_guild=True)
     async def birthdayset_export(self, ctx: commands.Context) -> None:
         """Export all stored birthdays as a CSV file."""
         lang = await self._lang(ctx.guild)
@@ -490,7 +614,7 @@ class Birthday(commands.Cog):
             if not bd:
                 continue
             m = ctx.guild.get_member(mid)
-            w.writerow([str(mid), m.name if m else "", bd])
+            w.writerow([str(mid), _csv_safe(m.name if m else ""), _csv_safe(bd)])
             count += 1
         if count == 0:
             await ctx.send(self._t(lang, "Keine Geburtstage gespeichert.", "No birthdays stored."))
@@ -507,6 +631,7 @@ class Birthday(commands.Cog):
 
     @birthdayset.command(name="import")
     @app_commands.describe(file="CSV file: UserID;Birthday (MM-DD or DD.MM.) per line")
+    @commands.admin_or_permissions(manage_guild=True)
     async def birthdayset_import(self, ctx: commands.Context, file: discord.Attachment) -> None:
         """Import birthdays from a CSV file (UserID;Birthday)."""
         lang = await self._lang(ctx.guild)
@@ -610,7 +735,19 @@ class Birthday(commands.Cog):
         ch = str(data.get("channel") or "").strip()
         await (conf.channel.set(int(ch)) if ch.isdigit() else conf.channel.clear())
         role = str(data.get("role") or "").strip()
-        await (conf.role.set(int(role)) if role.isdigit() else conf.role.clear())
+        role_obj = ctx.guild.get_role(int(role)) if role.isdigit() else None
+        role_warning = ""
+        if role_obj is not None:
+            problem = _role_problem(ctx.guild, role_obj, lang)
+            if problem:
+                return SubmitResult.fail(problem, {"role": problem})
+            if role_obj.members:
+                role_warning = " " + tr_lang(
+                    lang,
+                    f"Hinweis: Die Rolle hat bereits {len(role_obj.members)} Mitglied(er).",
+                    f"Note: the role already has {len(role_obj.members)} member(s).",
+                )
+        await (conf.role.set(role_obj.id) if role_obj is not None else conf.role.clear())
         await conf.hour.set(hour)
         await conf.timezone.set(tz_name)
         await conf.feb29_mode.set(feb29_mode)
@@ -619,7 +756,7 @@ class Birthday(commands.Cog):
         if msg:
             await conf.message.set(msg)
         await conf.language.set(lang)
-        return SubmitResult.ok(tr_lang(lang, "Gespeichert.", "Saved."))
+        return SubmitResult.ok(tr_lang(lang, "Gespeichert.", "Saved.") + role_warning)
 
     # ------------------------------------------------------------------ #
     # Dashboard page: birthday calendar (guild scope)

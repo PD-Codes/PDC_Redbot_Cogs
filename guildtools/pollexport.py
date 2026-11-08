@@ -1,13 +1,22 @@
 # guildtools/pollexport.py
+import asyncio
+import csv
 import io
 import re
+import time
 from typing import Dict, List, Tuple, Optional
 
 import discord
 from discord import app_commands
 from redbot.core import commands
 
+from .guildtools import csv_safe
 from .pdc_dashboard import register_dashboard, unregister_dashboard, tr_lang
+
+# Autocomplete reads channel history; cache the poll list per channel briefly
+# instead of loading up to 400 messages on every keystroke.
+POLL_CACHE_TTL = 60.0
+POLL_SCAN_LIMIT = 400
 
 
 # ---- small helper: fetch voters via REST call (paged) ----
@@ -59,12 +68,18 @@ class GuildToolsPollExport(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
+        # channel_id -> (timestamp, [(message_id, question)])
+        self._poll_cache: Dict[int, Tuple[float, List[Tuple[int, str]]]] = {}
+        self._poll_scans: Dict[int, asyncio.Task] = {}
 
     async def cog_load(self) -> None:
         register_dashboard(self)
 
     def cog_unload(self) -> None:
         unregister_dashboard(self)
+        for task in self._poll_scans.values():
+            task.cancel()
+        self._poll_scans.clear()
 
     async def _lang(self, guild) -> str:
         """Read the per-guild output language from the GuildTools cog (shared setting)."""
@@ -228,20 +243,58 @@ class GuildToolsPollExport(commands.Cog):
         cur = (current or "").lower()
         channel = interaction.channel
         choices: List[app_commands.Choice[str]] = []
-        seen_ids = set()
+        polls = await self._recent_polls(channel) if channel is not None else []
+        for mid, q in polls:
+            if (not cur) or (cur in (q or "").lower()) or (cur in str(mid)):
+                choices.append(app_commands.Choice(name=safe_label(q, mid), value=str(mid)))
+                if len(choices) >= 25:
+                    break
 
-        async def try_add_from_message(m: discord.Message):
-            if getattr(m, "poll", None) and m.id not in seen_ids:
-                q = getattr(m.poll.question, "text", str(m.poll.question))
-                label = safe_label(q, m.id)
-                if (not cur) or (cur in (q or "").lower()) or (cur in str(m.id)):
-                    choices.append(app_commands.Choice(name=label, value=str(m.id)))
-                    seen_ids.add(m.id)
+        if not choices:
+            typed = (current or "").strip()
+            if typed:
+                choices = [app_commands.Choice(name=tr_lang(lang, f"Direkte Eingabe verwenden: {typed[:100]}", f"Use direct input: {typed[:100]}")[:100], value=typed[:100])]
+            else:
+                choices = [app_commands.Choice(name=tr_lang(lang, "Keine Umfragen gefunden – gib ID/Link ein", "No polls found – enter an ID/link"), value="0")]
+
+        return choices[:25]
+
+    async def _recent_polls(self, channel) -> List[Tuple[int, str]]:
+        """Polls in `channel` (newest first), cached for POLL_CACHE_TTL seconds.
+        Concurrent keystrokes share one running scan."""
+        cid = channel.id
+        hit = self._poll_cache.get(cid)
+        if hit is not None and time.monotonic() - hit[0] < POLL_CACHE_TTL:
+            return hit[1]
+        task = self._poll_scans.get(cid)
+        if task is None or task.done():
+            task = asyncio.create_task(self._scan_polls(channel))
+            self._poll_scans[cid] = task
+        try:
+            polls = await asyncio.shield(task)
+        except Exception:
+            return []
+        finally:
+            if task.done() and self._poll_scans.get(cid) is task:
+                self._poll_scans.pop(cid, None)
+        if len(self._poll_cache) > 500:
+            self._poll_cache.clear()
+        self._poll_cache[cid] = (time.monotonic(), polls)
+        return polls
+
+    async def _scan_polls(self, channel) -> List[Tuple[int, str]]:
+        found: List[Tuple[int, str]] = []
+        seen = set()
+
+        def add(m: discord.Message) -> None:
+            if getattr(m, "poll", None) and m.id not in seen:
+                seen.add(m.id)
+                found.append((m.id, getattr(m.poll.question, "text", str(m.poll.question))))
 
         if isinstance(channel, (discord.TextChannel, discord.Thread)):
-            async for m in channel.history(limit=400, oldest_first=False):
-                await try_add_from_message(m)
-                if len(choices) >= 25:
+            async for m in channel.history(limit=POLL_SCAN_LIMIT, oldest_first=False):
+                add(m)
+                if len(found) >= 100:
                     break
         elif isinstance(channel, discord.ForumChannel):
             threads = list(channel.threads)
@@ -252,18 +305,10 @@ class GuildToolsPollExport(commands.Cog):
                     sm = th.starter_message or await th.fetch_message(th.id)
                 except Exception:
                     continue
-                await try_add_from_message(sm)
-                if len(choices) >= 25:
+                add(sm)
+                if len(found) >= 100:
                     break
-
-        if not choices:
-            typed = (current or "").strip()
-            if typed:
-                choices = [app_commands.Choice(name=tr_lang(lang, f"Direkte Eingabe verwenden: {typed[:100]}", f"Use direct input: {typed[:100]}"), value=typed)]
-            else:
-                choices = [app_commands.Choice(name=tr_lang(lang, "Keine Umfragen gefunden – gib ID/Link ein", "No polls found – enter an ID/link"), value="0")]
-
-        return choices[:25]
+        return found
 
     # ---- CSV generation ----
     def _build_csv(
@@ -275,10 +320,8 @@ class GuildToolsPollExport(commands.Cog):
         mode: str,
         lang: str = "en-US",
     ) -> Tuple[bytes, str]:
-        sep = ";"
-
         def esc(s: str) -> str:
-            return (s or "").replace("\r", " ").replace("\n", " ").strip()
+            return csv_safe((s or "").replace("\r", " ").replace("\n", " ").strip())
 
         # Map: user_id -> [answer texts]
         user_choices: Dict[int, List[str]] = {}
@@ -286,25 +329,24 @@ class GuildToolsPollExport(commands.Cog):
             for uid in answer_to_voters.get(ans_id, []):
                 user_choices.setdefault(uid, []).append(ans_text)
 
-        lines: List[str] = []
+        # csv module: correct quoting of ";" / quotes; csv_safe: no formula injection.
+        buf = io.StringIO()
+        w = csv.writer(buf, delimiter=";", lineterminator="\n")
         if mode == "key":
-            lines.append(tr_lang(lang, "Wahlmöglichkeit;Wähler (Komma getrennt)", "Option;Voters (comma separated)"))
+            w.writerow(tr_lang(lang, "Wahlmöglichkeit;Wähler (Komma getrennt)", "Option;Voters (comma separated)").split(";"))
             for aid, ans_text in answers:
                 voters = answer_to_voters.get(aid, [])
                 voters_names = ", ".join(self._user_name(guild, uid) for uid in voters)
-                lines.append(f"{esc(ans_text)}{sep}{esc(voters_names)}")
+                w.writerow([esc(ans_text), esc(voters_names)])
             filename = "poll_export_key_oriented.csv"
         else:
-            lines.append(tr_lang(lang, "Wähler;HatGewählt (Komma getrennt)", "Voter;Voted for (comma separated)"))
+            w.writerow(tr_lang(lang, "Wähler;HatGewählt (Komma getrennt)", "Voter;Voted for (comma separated)").split(";"))
             for uid, picks in user_choices.items():
                 picks_str = ", ".join(sorted(picks))
-                voter_name = self._user_name(guild, uid)
-                lines.append(f"{voter_name}{sep}{esc(picks_str)}")
+                w.writerow([esc(self._user_name(guild, uid)), esc(picks_str)])
             filename = "poll_export_value_oriented.csv"
 
-
-        content = "\n".join(lines) + "\n"
-        return content.encode("utf-8-sig"), filename
+        return buf.getvalue().encode("utf-8-sig"), filename
 
     def _find_answer_id(self, answers: List[Tuple[int, str]], text: str) -> int:
         for aid, t in answers:

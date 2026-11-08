@@ -23,6 +23,7 @@ try:
         SubmitResult,
         WidgetData,
         tr,
+        tr_lang,
     )
 
     DASHBOARD_AVAILABLE = True
@@ -52,6 +53,9 @@ except Exception:  # pdc_webdashboard not installed
 
     def tr(ctx, de, en):
         return de
+
+    def tr_lang(lang, de, en):
+        return de if str(lang or "").lower().startswith("de") else en
 
     def _noop_decorator(*_args, **_kwargs):
         def deco(func):

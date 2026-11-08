@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, List, Literal
+import io
+import json
+from typing import Dict, Optional, Tuple, List
 
 import discord
 from discord import app_commands
@@ -67,15 +69,6 @@ def min_to_hhmm(v: int) -> str:
     return f"{v // 60:02d}:{v % 60:02d}"
 
 
-def parse_time_or_none(s: Optional[str]) -> Optional[str]:
-    if not s:
-        return None
-    s = s.strip()
-    if TIME_RE.match(s):
-        return s
-    return None
-
-
 def normalize_time_input(s: Optional[str]) -> Optional[str]:
     if s is None: return None
     s = str(s).strip()
@@ -98,7 +91,32 @@ def normalize_time_input(s: Optional[str]) -> Optional[str]:
     return None
 
 def parse_time_or_none(s: Optional[str]) -> Optional[str]:
+    """Accept HH:MM or compact input ("22", "915", "2230"); None if invalid."""
     return normalize_time_input(s)
+
+
+# Discord embed limits
+FIELD_VALUE_LIMIT = 1024
+DESCRIPTION_LIMIT = 4096
+EMBED_TOTAL_LIMIT = 6000
+MAX_FIELDS = 25
+
+
+def _chunk_join(parts: List[str], sep: str, limit: int) -> List[str]:
+    """Join `parts` with `sep` into chunks no longer than `limit` characters."""
+    chunks: List[str] = []
+    cur = ""
+    for part in parts:
+        part = part[:limit]
+        cand = part if not cur else cur + sep + part
+        if len(cand) > limit:
+            chunks.append(cur)
+            cur = part
+        else:
+            cur = cand
+    if cur:
+        chunks.append(cur)
+    return chunks
 
 
 def overlaps(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
@@ -157,6 +175,43 @@ class ReadyTimes(commands.Cog):
 
     async def cog_load(self) -> None:
         register_dashboard(self)
+
+    async def red_delete_data_for_user(self, *, requester: str, user_id: int) -> None:
+        all_members = await self.config.all_members()
+        for gid, members in all_members.items():
+            if user_id in members:
+                await self.config.member_from_ids(gid, user_id).clear()
+
+    async def red_get_data_for_user(self, *, user_id: int) -> Dict[str, io.BytesIO]:
+        all_members = await self.config.all_members()
+        data = {str(gid): members[user_id] for gid, members in all_members.items() if user_id in members}
+        if not data:
+            return {}
+        return {"readytimes.json": io.BytesIO(json.dumps(data, indent=2).encode("utf-8"))}
+
+    async def _send_embeds(self, interaction: discord.Interaction, embeds: List[discord.Embed]) -> None:
+        """Send embeds as ephemeral follow-ups (max 10 / 6000 chars per message)."""
+        batch: List[discord.Embed] = []
+        total = 0
+        for emb in embeds:
+            size = len(emb)
+            if batch and (len(batch) >= 10 or total + size > EMBED_TOTAL_LIMIT):
+                await interaction.followup.send(embeds=batch, ephemeral=True)
+                batch, total = [], 0
+            batch.append(emb)
+            total += size
+        if batch:
+            await interaction.followup.send(embeds=batch, ephemeral=True)
+
+    @staticmethod
+    def _list_embeds(title: str, lines: List[str], empty: str, color: discord.Color) -> List[discord.Embed]:
+        """One or more embeds whose descriptions stay within the limit."""
+        chunks = _chunk_join(lines, "\n", DESCRIPTION_LIMIT - 96) or [empty]
+        out = []
+        for i, chunk in enumerate(chunks):
+            t = title if i == 0 else f"{title} ({i + 1})"
+            out.append(discord.Embed(title=t[:256], description=chunk, color=color))
+        return out
 
     def cog_unload(self) -> None:
         unregister_dashboard(self)
@@ -249,13 +304,18 @@ class ReadyTimes(commands.Cog):
         if end and not end_t:
             return await interaction.response.send_message(tr_lang(lang, "Ungültige Endzeit. Nutze HH:MM (24h).", "Invalid end time. Use HH:MM (24h)."), ephemeral=True)
 
-        # Guild members (excluding bots)
+        # Large guilds: reading every member takes a moment -> defer first.
+        await interaction.response.defer(ephemeral=True)
+
+        # One config read for all members (instead of one query per member).
+        all_data = await self.config.all_members(interaction.guild)
         results = []
-        for member in interaction.guild.members:
-            if member.bot:
+        for member_id, data in all_data.items():
+            member = interaction.guild.get_member(member_id)
+            if member is None or member.bot:
                 continue
-            data = await self.config.member(member).get_raw()
             results.append((member, data))
+        results.sort(key=lambda x: x[0].display_name.lower())
 
         # Helper: normalize day (key like "monday"); also accept "Montag"
         day_key = None
@@ -273,25 +333,34 @@ class ReadyTimes(commands.Cog):
                 elif d in en2key:
                     day_key = en2key[d]
                 else:
-                    return await interaction.response.send_message(tr_lang(lang, "Unbekannter Wochentag.", "Unknown weekday."), ephemeral=True)
+                    return await interaction.followup.send(tr_lang(lang, "Unbekannter Wochentag.", "Unknown weekday."), ephemeral=True)
 
         none_str = tr_lang(lang, "Keiner!", "Nobody!")
 
         # 1) No args => overall overview
         if not day_key and not start_t and not end_t:
-            embed = discord.Embed(title=tr_lang(lang, "Gesamtübersicht Verfügbarkeiten", "Overall availability"), color=discord.Color.blurple())
+            title = tr_lang(lang, "Gesamtübersicht Verfügbarkeiten", "Overall availability")
+            fields: List[Tuple[str, str]] = []
             for key in DAY_ORDER:
                 parts: List[str] = []
                 for member, data in results:
                     info = data.get(key, {"can": False, "start": None, "end": None})
                     if info["can"]:
                         parts.append(f"{member.display_name} ({format_range(info['start'], info['end'], lang)})")
-                embed.add_field(
-                    name=day_label(key, lang),
-                    value=", ".join(parts) if parts else none_str,
-                    inline=False,
-                )
-            return await interaction.response.send_message(embed=embed, ephemeral=True)
+                # Split long days over several fields (1024 chars per field value).
+                chunks = _chunk_join(parts, ", ", FIELD_VALUE_LIMIT) or [none_str]
+                for i, chunk in enumerate(chunks):
+                    name = day_label(key, lang) if i == 0 else f"{day_label(key, lang)} ({i + 1})"
+                    fields.append((name, chunk))
+            embeds: List[discord.Embed] = []
+            cur = discord.Embed(title=title, color=discord.Color.blurple())
+            for name, value in fields:
+                if len(cur.fields) >= MAX_FIELDS or len(cur) + len(name) + len(value) > EMBED_TOTAL_LIMIT - 100:
+                    embeds.append(cur)
+                    cur = discord.Embed(title=f"{title} ({len(embeds) + 1})", color=discord.Color.blurple())
+                cur.add_field(name=name, value=value, inline=False)
+            embeds.append(cur)
+            return await self._send_embeds(interaction, embeds)
 
         # 2) Day only => list including time window
         if day_key and not start_t and not end_t:
@@ -300,12 +369,9 @@ class ReadyTimes(commands.Cog):
                 info = data.get(day_key, {"can": False, "start": None, "end": None})
                 if info["can"]:
                     lines.append(f"{member.display_name} ({format_range(info['start'], info['end'], lang)})")
-            embed = discord.Embed(
-                title=f"{day_label(day_key, lang)}",
-                description="\n".join(lines) if lines else none_str,
-                color=discord.Color.blurple(),
+            return await self._send_embeds(
+                interaction, self._list_embeds(day_label(day_key, lang), lines, none_str, discord.Color.blurple())
             )
-            return await interaction.response.send_message(embed=embed, ephemeral=True)
 
         # 3) Day + (start/end)
         if day_key and (start_t or end_t):
@@ -331,12 +397,9 @@ class ReadyTimes(commands.Cog):
                         lines.append(member.display_name)
 
             title = f"{day_label(day_key, lang)} — {format_range_with_parens(start_t, end_t, lang)}"
-            embed = discord.Embed(
-                title=title,
-                description="\n".join(lines) if lines else none_str,
-                color=discord.Color.green(),
+            return await self._send_embeds(
+                interaction, self._list_embeds(title, lines, none_str, discord.Color.green())
             )
-            return await interaction.response.send_message(embed=embed, ephemeral=True)
 
         # 4) Time(s) only (no day) => days per user; for only-from show (end), for only-to show (start)
         if (start_t or end_t) and not day_key:
@@ -364,15 +427,12 @@ class ReadyTimes(commands.Cog):
                     lines.append(f"{member.display_name} ({', '.join(day_tokens)})")
 
             title = tr_lang(lang, f"Zeitfenster — {format_range_with_parens(start_t, end_t, 'de-DE')}", f"Time window — {format_range_with_parens(start_t, end_t, 'en-US')}")
-            embed = discord.Embed(
-                title=title,
-                description="\n".join(lines) if lines else none_str,
-                color=discord.Color.purple(),
+            return await self._send_embeds(
+                interaction, self._list_embeds(title, lines, none_str, discord.Color.purple())
             )
-            return await interaction.response.send_message(embed=embed, ephemeral=True)
 
         # Fallback
-        return await interaction.response.send_message(tr_lang(lang, "Ungültige Kombination.", "Invalid combination."), ephemeral=True)
+        return await interaction.followup.send(tr_lang(lang, "Ungültige Kombination.", "Invalid combination."), ephemeral=True)
 
 
 
@@ -533,7 +593,7 @@ class TimesModal(discord.ui.Modal, title="Zeiten eintragen (HH:MM)"):
     async def on_submit(self, interaction: discord.Interaction):
         s = normalize_time_input(self.start.value)
         e = normalize_time_input(self.end.value)
-        if not TIME_RE.match(s) or not TIME_RE.match(e):
+        if not s or not e or not TIME_RE.match(s) or not TIME_RE.match(e):
             return await interaction.response.send_message(tr_lang(self.lang, "Bitte HH:MM 24h-Format verwenden.", "Please use HH:MM 24h format."), ephemeral=True)
         if hhmm_to_min(s) == hhmm_to_min(e):
             return await interaction.response.send_message(tr_lang(self.lang, "Start und Ende dürfen nicht gleich sein.", "Start and end must not be equal."), ephemeral=True)

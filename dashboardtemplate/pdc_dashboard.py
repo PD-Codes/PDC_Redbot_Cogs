@@ -49,14 +49,16 @@ try:
 except Exception:  # pdc_webdashboard not installed
     DASHBOARD_AVAILABLE = False
 
+    # NOTE: en-US is the default language whenever no explicit choice exists.
     def L(de, en=None):
-        return de
+        return en if en is not None else de
 
     def tr(ctx, de, en):
-        return de
+        loc = str(getattr(ctx, "locale", "") or "")
+        return de if loc.lower().startswith("de") else en
 
     def tr_lang(lang, de, en):
-        return de
+        return de if str(lang or "").lower().startswith("de") else en
 
     def _noop_decorator(*_args, **_kwargs):
         def deco(func):

@@ -11,8 +11,10 @@ top-starred page) via the resilient drop-in.
 from __future__ import annotations
 
 import asyncio
+import io
+import json
 import logging
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import discord
 from discord import app_commands
@@ -65,7 +67,9 @@ class Starboard(commands.Cog):
             entries={},
         )
         # Debounce tasks per message: message_id -> asyncio.Task
-        self._star_tasks: dict = {}
+        self._star_tasks: Dict[int, asyncio.Task] = {}
+        # Serialize create/update/delete of a star post per message.
+        self._star_locks: Dict[int, asyncio.Lock] = {}
 
     async def cog_load(self) -> None:
         register_dashboard(self)
@@ -92,14 +96,15 @@ class Starboard(commands.Cog):
 
     async def red_get_data_for_user(self, *, user_id: int) -> dict:
         """Return which starboard entries reference the user as author."""
-        lines: List[str] = []
+        found: List[dict] = []
         for guild_id, data in (await self.config.all_guilds()).items():
             for mid, entry in (data.get("entries") or {}).items():
                 if entry.get("author") == user_id:
-                    lines.append(f"guild {guild_id}: message {mid} with {entry.get('count', 0)} star(s)")
-        if not lines:
+                    found.append({"guild_id": guild_id, "message_id": mid, "stars": entry.get("count", 0)})
+        if not found:
             return {}
-        return {"starboard.txt": "\n".join(lines).encode("utf-8")}
+        payload = json.dumps({"starboard_entries": found}, indent=2).encode("utf-8")
+        return {"starboard.json": io.BytesIO(payload)}
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -134,8 +139,26 @@ class Starboard(commands.Cog):
             or (payload_emoji.id is not None and str(payload_emoji.id) in configured)
         )
 
+    @staticmethod
+    async def _user_reacted(reaction: discord.Reaction, user_id: int) -> bool:
+        """Targeted check whether ``user_id`` added ``reaction``.
+
+        Reaction users are returned sorted by ID, so asking for the first user
+        after ``user_id - 1`` returns that user if (and only if) they reacted.
+        """
+        try:
+            async for user in reaction.users(limit=1, after=discord.Object(id=user_id - 1)):
+                return user.id == user_id
+        except discord.HTTPException:
+            return False
+        return False
+
     async def _count_stars(self, message: discord.Message, configured: str, selfstar: bool) -> int:
-        """Count valid star reactions on a message (bots never count)."""
+        """Count star reactions from the cached reaction count.
+
+        The bot's own reaction is subtracted; the author's self-star is
+        subtracted via one targeted lookup instead of paging all reactors.
+        """
         for reaction in message.reactions:
             if str(reaction.emoji) != configured and not (
                 isinstance(reaction.emoji, (discord.Emoji, discord.PartialEmoji))
@@ -143,26 +166,26 @@ class Starboard(commands.Cog):
                      or str(getattr(reaction.emoji, "id", "")) in configured)
             ):
                 continue
-            if selfstar:
-                # Fast path: use the raw count instead of paginating all users
-                # (only the bot's own reaction is subtracted).
-                count = int(reaction.count or 0)
-                if getattr(reaction, "me", False):
+            count = int(reaction.count or 0)
+            if getattr(reaction, "me", False):
+                count -= 1
+            if not selfstar and count > 0 and not message.author.bot:
+                if await self._user_reacted(reaction, message.author.id):
                     count -= 1
-                return max(0, count)
-            count = 0
-            try:
-                async for user in reaction.users():
-                    if user.bot:
-                        continue
-                    if user.id == message.author.id:
-                        continue
-                    count += 1
-            except discord.HTTPException:
-                # Fall back to the raw count when member fetching fails.
-                count = reaction.count
-            return count
+            return max(0, count)
         return 0
+
+    @staticmethod
+    def _is_public(channel) -> bool:
+        """True if @everyone can see ``channel`` (private threads never are)."""
+        if channel is None:
+            return False
+        if isinstance(channel, discord.Thread) and channel.type == discord.ChannelType.private_thread:
+            return False
+        try:
+            return bool(channel.permissions_for(channel.guild.default_role).view_channel)
+        except Exception:
+            return False
 
     def _star_embed(self, message: discord.Message, count: int, lang: str, jump: bool) -> discord.Embed:
         """Build the starboard embed for a message."""
@@ -212,28 +235,69 @@ class Starboard(commands.Cog):
         await self._handle_reaction(payload)
 
     async def _handle_reaction(self, payload: discord.RawReactionActionEvent) -> None:
+        """Cheap pre-filter, then debounce: one sync per message per burst."""
         if payload.guild_id is None:
             return
         guild = self.bot.get_guild(payload.guild_id)
         if guild is None:
             return
+        if await self.bot.cog_disabled_in_guild(self, guild):
+            return
+        conf = await self.config.guild(guild).all()
+        if not conf.get("enabled", True):
+            return
+        if not self._emoji_matches(payload.emoji, str(conf.get("emoji") or "⭐")):
+            return
+        mid = payload.message_id
+        pending = self._star_tasks.get(mid)
+        if pending is not None and not pending.done():
+            return  # the pending run will read the latest reaction state
+        self._star_tasks[mid] = asyncio.create_task(
+            self._debounced_sync(guild.id, payload.channel_id, mid, payload.emoji)
+        )
+
+    async def _debounced_sync(self, guild_id: int, channel_id: int, message_id: int, emoji) -> None:
+        try:
+            await asyncio.sleep(STAR_DEBOUNCE_SECONDS)
+        finally:
+            # From here on, new reactions schedule a fresh run (which then
+            # waits for the lock below and sees the newest state).
+            if self._star_tasks.get(message_id) is asyncio.current_task():
+                self._star_tasks.pop(message_id, None)
+        lock = self._star_locks.setdefault(message_id, asyncio.Lock())
+        try:
+            async with lock:
+                guild = self.bot.get_guild(guild_id)
+                if guild is not None:
+                    await self._process_reaction(guild, channel_id, message_id, emoji)
+        except Exception:
+            log.exception("Starboard: processing message %s failed", message_id)
+        finally:
+            if not lock.locked() and message_id not in self._star_tasks:
+                self._star_locks.pop(message_id, None)
+
+    async def _process_reaction(self, guild: discord.Guild, channel_id: int, message_id: int, emoji) -> None:
         conf = await self.config.guild(guild).all()
         if not conf.get("enabled", True):
             return
         star_channel = guild.get_channel(conf.get("channel") or 0)
         if star_channel is None:
             return
-        if not self._emoji_matches(payload.emoji, str(conf.get("emoji") or "⭐")):
+        if not self._emoji_matches(emoji, str(conf.get("emoji") or "⭐")):
             return
-        if payload.channel_id == star_channel.id:
+        if channel_id == star_channel.id:
             return  # never star the starboard itself
-        if payload.channel_id in (conf.get("ignore_channels") or []):
+        if channel_id in (conf.get("ignore_channels") or []):
             return
-        source = guild.get_channel_or_thread(payload.channel_id)
+        source = guild.get_channel_or_thread(channel_id)
         if source is None:
             return
+        # Never leak content from channels @everyone cannot see into a
+        # starboard that is more visible than the source.
+        if not self._is_public(source) and self._is_public(star_channel):
+            return
         try:
-            message = await source.fetch_message(payload.message_id)
+            message = await source.fetch_message(message_id)
         except discord.HTTPException:
             return  # deleted message or missing permissions
         if message.author.bot and conf.get("ignore_bots", True):

@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import io
+import json
 import logging
 import random
 import re
 import time
 import uuid
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import discord
 from discord import app_commands
@@ -105,6 +107,34 @@ class Giveaway(commands.Cog):
             self._task.cancel()
         if self._view:
             self._view.stop()
+
+    # ------------------------------------------------------------------ #
+    # Red end-user data API
+    # ------------------------------------------------------------------ #
+    async def red_delete_data_for_user(self, *, requester: str, user_id: int) -> None:
+        all_guilds = await self.config.all_guilds()
+        for gid in all_guilds:
+            async with self.config.guild_from_id(gid).giveaways() as gws:
+                for gw in gws:
+                    for key in ("entrants", "won", "past_winners"):
+                        if user_id in (gw.get(key) or []):
+                            gw[key] = [u for u in gw[key] if u != user_id]
+                    if gw.get("host") == user_id:
+                        gw["host"] = None
+
+    async def red_get_data_for_user(self, *, user_id: int) -> Dict[str, io.BytesIO]:
+        out = []
+        all_guilds = await self.config.all_guilds()
+        for gid, gconf in all_guilds.items():
+            for gw in gconf.get("giveaways") or []:
+                roles = [k for k in ("entrants", "won", "past_winners") if user_id in (gw.get(k) or [])]
+                if gw.get("host") == user_id:
+                    roles.append("host")
+                if roles:
+                    out.append({"guild_id": gid, "giveaway": gw.get("id"), "prize": gw.get("prize"), "as": roles})
+        if not out:
+            return {}
+        return {"giveaway.json": io.BytesIO(json.dumps(out, indent=2).encode("utf-8"))}
 
     @staticmethod
     def _t(lang: str, de: str, en: str) -> str:
@@ -206,33 +236,47 @@ class Giveaway(commands.Cog):
                 )
         return None
 
+    def _toggle_entry(self, guild: discord.Guild, gw: dict, user: discord.abc.User, lang: str):
+        """Pure data change (runs inside the config lock): returns (joined, reject)."""
+        uid = user.id
+        entrants = gw.setdefault("entrants", [])
+        if uid in entrants:
+            # Withdrawing is always allowed, regardless of requirements.
+            entrants.remove(uid)
+            return False, None
+        member = guild.get_member(uid) or user
+        if isinstance(member, discord.Member):
+            reject = self._eligibility_error(member, gw, lang)
+            if reject is not None:
+                return None, reject
+        entrants.append(uid)
+        return True, None
+
     async def _handle_enter(self, interaction: discord.Interaction) -> None:
         guild = interaction.guild
         if guild is None or interaction.message is None:
             return
         lang = await self._lang(guild)
+        if await self.bot.cog_disabled_in_guild(self, guild):
+            await interaction.response.send_message(
+                self._t(lang, "Giveaways sind auf diesem Server deaktiviert.", "Giveaways are disabled on this server."),
+                ephemeral=True,
+            )
+            return
         joined = None
         reject: Optional[str] = None
+        found = True
         async with self.config.guild(guild).giveaways() as gws:
             gw = next((g for g in gws if g.get("message") == interaction.message.id and not g.get("ended")), None)
             if gw is None:
-                await interaction.response.send_message(
-                    self._t(lang, "Dieses Giveaway ist beendet.", "This giveaway has ended."), ephemeral=True
-                )
-                return
-            uid = interaction.user.id
-            entrants = gw.setdefault("entrants", [])
-            if uid in entrants:
-                # Withdrawing is always allowed, regardless of requirements.
-                entrants.remove(uid)
-                joined = False
+                found = False
             else:
-                member = guild.get_member(uid) or interaction.user
-                if isinstance(member, discord.Member):
-                    reject = self._eligibility_error(member, gw, lang)
-                if reject is None:
-                    entrants.append(uid)
-                    joined = True
+                joined, reject = self._toggle_entry(guild, gw, interaction.user, lang)
+        if not found:
+            await interaction.response.send_message(
+                self._t(lang, "Dieses Giveaway ist beendet.", "This giveaway has ended."), ephemeral=True
+            )
+            return
         if reject is not None:
             await interaction.response.send_message(reject, ephemeral=True)
             return
@@ -252,6 +296,11 @@ class Giveaway(commands.Cog):
             return []
         return random.sample(entrants, min(max(1, count), len(entrants)))
 
+    def _eligible_pool(self, guild: discord.Guild, gw: dict, exclude=()) -> List[int]:
+        """Entrants that are still members of the guild (minus `exclude`)."""
+        skip = set(exclude)
+        return [u for u in dict.fromkeys(gw.get("entrants") or []) if u not in skip and guild.get_member(u) is not None]
+
     async def _dm_winners(self, guild, gw, lang: str) -> None:
         """DM each winner; failures fall back to the channel mention silently."""
         channel_id, message_id = gw.get("channel"), gw.get("message")
@@ -270,9 +319,14 @@ class Giveaway(commands.Cog):
                 # DMs closed -> the channel announcement mention is the fallback.
                 pass
 
-    async def _finish(self, guild, gw, lang: str, *, dm: bool = True) -> None:
+    def _finalize(self, guild, gw) -> dict:
+        """Mark a giveaway as ended and draw winners (data only, no network).
+        Returns a snapshot for `_announce`, which runs outside the config lock."""
         gw["ended"] = True
-        gw["won"] = self._draw(gw.get("entrants", []), gw.get("winners", 1))
+        gw["won"] = self._draw(self._eligible_pool(guild, gw), gw.get("winners", 1))
+        return dict(gw)
+
+    async def _announce(self, guild, gw: dict, lang: str, *, dm: bool = True) -> None:
         channel = guild.get_channel(gw.get("channel"))
         if channel is None:
             return
@@ -307,17 +361,23 @@ class Giveaway(commands.Cog):
     async def _tick(self) -> None:
         now = time.time()
         for guild in self.bot.guilds:
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                continue
             gconf = await self.config.guild(guild).all()
             lang = str(gconf.get("language") or "en-US")
             dm = bool(gconf.get("dm_winners", True))
             cleanup_days = max(1, int(gconf.get("cleanup_days") or 2))
+            finished: List[dict] = []
             async with self.config.guild(guild).giveaways() as gws:
                 due = [g for g in gws if not g.get("ended") and g.get("end", 0) <= now]
                 for gw in due:
-                    await self._finish(guild, gw, lang, dm=dm)
+                    finished.append(self._finalize(guild, gw))
                 # Prune giveaways ended more than `cleanup_days` days ago.
                 cutoff = now - cleanup_days * 86400
                 gws[:] = [g for g in gws if not (g.get("ended") and g.get("end", 0) < cutoff)]
+            # Network I/O only after the config lock is released.
+            for snap in finished:
+                await self._announce(guild, snap, lang, dm=dm)
 
     # ------------------------------------------------------------------ #
     # Commands (running giveaways: moderators and up)
@@ -325,6 +385,7 @@ class Giveaway(commands.Cog):
     @commands.hybrid_group(name="giveaway", aliases=["gw"])
     @commands.mod_or_permissions(manage_messages=True)
     @commands.guild_only()
+    @app_commands.default_permissions(manage_messages=True)
     async def giveaway(self, ctx: commands.Context) -> None:
         """Run and manage giveaways."""
 
@@ -335,6 +396,7 @@ class Giveaway(commands.Cog):
         winners="Number of winners",
         prize="What is being given away",
     )
+    @commands.mod_or_permissions(manage_messages=True)
     async def gw_start(
         self,
         ctx: commands.Context,
@@ -385,20 +447,24 @@ class Giveaway(commands.Cog):
 
     @giveaway.command(name="end")
     @app_commands.describe(giveaway_id="The giveaway ID (from 'giveaway list')")
+    @commands.mod_or_permissions(manage_messages=True)
     async def gw_end(self, ctx: commands.Context, giveaway_id: str) -> None:
         """End a running giveaway early and draw now."""
         lang = await self._lang(ctx.guild)
         dm = bool(await self.config.guild(ctx.guild).dm_winners())
-        done = False
+        snap = None
         async with self.config.guild(ctx.guild).giveaways() as gws:
             gw = next((g for g in gws if g.get("id") == giveaway_id and not g.get("ended")), None)
             if gw is not None:
-                await self._finish(ctx.guild, gw, lang, dm=dm)
-                done = True
+                snap = self._finalize(ctx.guild, gw)
+        done = snap is not None
+        if snap is not None:
+            await self._announce(ctx.guild, snap, lang, dm=dm)
         await ctx.send(self._t(lang, "Beendet & ausgelost." if done else "Nicht gefunden.", "Ended & drawn." if done else "Not found."))
 
     @giveaway.command(name="reroll")
     @app_commands.describe(giveaway_id="The giveaway ID", count="How many winners to draw (default: original count)")
+    @commands.mod_or_permissions(manage_messages=True)
     async def gw_reroll(self, ctx: commands.Context, giveaway_id: str, count: Optional[int] = None) -> None:
         """Reroll the winners of an ended giveaway (optionally N winners)."""
         lang = await self._lang(ctx.guild)
@@ -411,16 +477,21 @@ class Giveaway(commands.Cog):
         async with self.config.guild(ctx.guild).giveaways() as gws:
             gw = next((g for g in gws if g.get("id") == giveaway_id and g.get("ended")), None)
             if gw is not None:
-                gw["won"] = self._draw(gw.get("entrants", []), count or gw.get("winners", 1))
+                # Previous winners (of the draw and all earlier rerolls) are excluded.
+                past = list(dict.fromkeys((gw.get("past_winners") or []) + (gw.get("won") or [])))
+                gw["past_winners"] = past
+                pool = self._eligible_pool(ctx.guild, gw, exclude=past)
+                gw["won"] = self._draw(pool, count or gw.get("winners", 1))
                 winners = gw["won"]
                 drawn_gw = dict(gw)
-                channel = ctx.guild.get_channel(gw.get("channel"))
-                if channel is not None:
-                    try:
-                        m = await channel.fetch_message(gw.get("message"))
-                        await m.edit(embed=self._embed(ctx.guild, gw, lang))
-                    except discord.HTTPException:
-                        pass
+        if drawn_gw is not None:
+            channel = ctx.guild.get_channel(drawn_gw.get("channel"))
+            if channel is not None:
+                try:
+                    m = await channel.fetch_message(drawn_gw.get("message"))
+                    await m.edit(embed=self._embed(ctx.guild, drawn_gw, lang))
+                except discord.HTTPException:
+                    pass
         if winners is None:
             await ctx.send(self._t(lang, "Nicht gefunden (oder läuft noch).", "Not found (or still running)."))
         elif winners:
@@ -431,6 +502,7 @@ class Giveaway(commands.Cog):
             await ctx.send(self._t(lang, "Keine Teilnehmer.", "No entries."))
 
     @giveaway.command(name="list")
+    @commands.mod_or_permissions(manage_messages=True)
     async def gw_list(self, ctx: commands.Context) -> None:
         """List running giveaways (paginated)."""
         lang = await self._lang(ctx.guild)
@@ -458,6 +530,7 @@ class Giveaway(commands.Cog):
 
     @giveaway.command(name="entries")
     @app_commands.describe(giveaway_id="The giveaway ID (from 'giveaway list')")
+    @commands.mod_or_permissions(manage_messages=True)
     async def gw_entries(self, ctx: commands.Context, giveaway_id: str) -> None:
         """Show the entrants of a giveaway (paginated)."""
         lang = await self._lang(ctx.guild)
@@ -494,11 +567,13 @@ class Giveaway(commands.Cog):
     @commands.hybrid_group(name="giveawayset", aliases=["gwset"])
     @commands.admin_or_permissions(manage_guild=True)
     @commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
     async def giveawayset(self, ctx: commands.Context) -> None:
         """Configure the giveaway module."""
 
     @giveawayset.command(name="enable")
     @app_commands.describe(on_off="Enable or disable giveaways")
+    @commands.admin_or_permissions(manage_guild=True)
     async def gws_enable(self, ctx: commands.Context, on_off: bool) -> None:
         """Enable/disable the module for this server."""
         lang = await self._lang(ctx.guild)
@@ -508,6 +583,7 @@ class Giveaway(commands.Cog):
 
     @giveawayset.command(name="dmwinners")
     @app_commands.describe(on_off="DM winners in addition to the channel announcement")
+    @commands.admin_or_permissions(manage_guild=True)
     async def gws_dmwinners(self, ctx: commands.Context, on_off: bool) -> None:
         """Toggle DM notifications for winners."""
         lang = await self._lang(ctx.guild)
@@ -520,6 +596,7 @@ class Giveaway(commands.Cog):
 
     @giveawayset.command(name="cleanup")
     @app_commands.describe(days="Days to keep ended giveaways before auto-cleanup (1-30)")
+    @commands.admin_or_permissions(manage_guild=True)
     async def gws_cleanup(self, ctx: commands.Context, days: int) -> None:
         """Set after how many days ended giveaways are removed."""
         lang = await self._lang(ctx.guild)
@@ -535,6 +612,7 @@ class Giveaway(commands.Cog):
 
     @giveawayset.command(name="reqrole")
     @app_commands.describe(role="Required role for entry (leave empty to clear)")
+    @commands.admin_or_permissions(manage_guild=True)
     async def gws_reqrole(self, ctx: commands.Context, role: Optional[discord.Role] = None) -> None:
         """Set (or clear) the role required to enter new giveaways."""
         lang = await self._lang(ctx.guild)
@@ -547,6 +625,7 @@ class Giveaway(commands.Cog):
 
     @giveawayset.command(name="minaccountage")
     @app_commands.describe(days="Minimum account age in days (0 = off)")
+    @commands.admin_or_permissions(manage_guild=True)
     async def gws_minaccountage(self, ctx: commands.Context, days: int) -> None:
         """Set the minimum Discord account age (days) for entry."""
         lang = await self._lang(ctx.guild)
@@ -562,6 +641,7 @@ class Giveaway(commands.Cog):
 
     @giveawayset.command(name="minmember")
     @app_commands.describe(days="Minimum days in this server (0 = off)")
+    @commands.admin_or_permissions(manage_guild=True)
     async def gws_minmember(self, ctx: commands.Context, days: int) -> None:
         """Set the minimum server membership duration (days) for entry."""
         lang = await self._lang(ctx.guild)
@@ -577,6 +657,7 @@ class Giveaway(commands.Cog):
 
     @giveawayset.command(name="language")
     @app_commands.describe(language="Output language: de-DE or en-US")
+    @commands.admin_or_permissions(manage_guild=True)
     async def gws_language(self, ctx: commands.Context, language: str) -> None:
         """Set the output language for this server."""
         language = "de-DE" if language.lower().startswith("de") else "en-US"

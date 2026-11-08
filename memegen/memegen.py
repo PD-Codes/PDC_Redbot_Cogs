@@ -22,6 +22,7 @@ import re
 import time
 from collections import deque
 from typing import Deque, Dict, Optional, Tuple
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 import discord
@@ -51,9 +52,39 @@ _SUBREDDIT_RE = re.compile(r"^[A-Za-z0-9_]{2,21}$")
 _IMAGE_EXT = (".jpg", ".jpeg", ".png", ".gif", ".webp")
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024  # Discord's non-boosted upload cap
+MAX_IMAGE_REDIRECTS = 3
+# Hosts the bot itself may download meme images from (SSRF guard).
+_IMAGE_HOSTS = frozenset({
+    "i.redd.it",
+    "preview.redd.it",
+    "external-preview.redd.it",
+    "i.imgur.com",
+})
 RECENT_PER_CHANNEL = 20  # de-dup recently shown memes per channel
 HTTP_RETRIES = 3
 HTTP_TIMEOUT = 10  # seconds
+
+
+def normalize_subreddit(name: str) -> str:
+    """Strip an optional ``r/`` / ``/r/`` prefix (any case) and lowercase.
+
+    ``str.lstrip("r/")`` would strip *characters*, mangling names such as
+    ``rarepuppers`` -> ``arepuppers``.
+    """
+    value = str(name or "").strip()
+    for prefix in ("/r/", "r/"):
+        if value.lower().startswith(prefix):
+            value = value[len(prefix):]
+            break
+    return value.strip().strip("/").lower()
+
+
+def _image_host_allowed(url: str) -> bool:
+    try:
+        parsed = urlparse(str(url or ""))
+    except ValueError:
+        return False
+    return parsed.scheme == "https" and (parsed.hostname or "").lower() in _IMAGE_HOSTS
 
 
 class MemeGen(commands.Cog):
@@ -160,6 +191,8 @@ class MemeGen(commands.Cog):
             url = str(d.get("url_overridden_by_dest") or d.get("url") or "")
             if not url.lower().endswith(_IMAGE_EXT):
                 continue
+            if not _image_host_allowed(url):
+                continue
             if d.get("spoiler") or d.get("stickied"):
                 continue
             if d.get("over_18") and not allow_nsfw:
@@ -235,22 +268,35 @@ class MemeGen(commands.Cog):
         ext = next((e for e in _IMAGE_EXT if url.lower().split("?")[0].endswith(e)), None)
         try:
             session = await self._get_session()
-            async with session.get(url) as resp:
-                if resp.status != 200:
+            current = url
+            for _hop in range(MAX_IMAGE_REDIRECTS + 1):
+                # Only download from known image hosts; redirects are followed
+                # manually and must stay on an allowed host as well.
+                if not _image_host_allowed(current):
                     return None
-                if not ext:
-                    ctype = resp.headers.get("Content-Type", "").split(";")[0].strip()
-                    ext = mimetypes.guess_extension(ctype) or ".jpg"
-                    if ext == ".jpe":
-                        ext = ".jpg"
-                if resp.content_length and resp.content_length > MAX_IMAGE_BYTES:
-                    return None
-                data = bytearray()
-                async for chunk in resp.content.iter_chunked(65536):
-                    data.extend(chunk)
-                    if len(data) > MAX_IMAGE_BYTES:
+                async with session.get(current, allow_redirects=False) as resp:
+                    if resp.status in (301, 302, 303, 307, 308):
+                        location = resp.headers.get("Location")
+                        if not location:
+                            return None
+                        current = urljoin(current, location)
+                        continue
+                    if resp.status != 200:
                         return None
-                return bytes(data), ext
+                    if not ext:
+                        ctype = resp.headers.get("Content-Type", "").split(";")[0].strip()
+                        ext = mimetypes.guess_extension(ctype) or ".jpg"
+                        if ext == ".jpe":
+                            ext = ".jpg"
+                    if resp.content_length and resp.content_length > MAX_IMAGE_BYTES:
+                        return None
+                    data = bytearray()
+                    async for chunk in resp.content.iter_chunked(65536):
+                        data.extend(chunk)
+                        if len(data) > MAX_IMAGE_BYTES:
+                            return None
+                    return bytes(data), ext
+            return None
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -334,6 +380,8 @@ class MemeGen(commands.Cog):
             guild = self.bot.get_guild(gid)
             if guild is None:
                 continue
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                continue
             channel = guild.get_channel(gconf.get("channel"))
             if channel is None or not channel.permissions_for(guild.me).send_messages:
                 continue
@@ -371,7 +419,7 @@ class MemeGen(commands.Cog):
             subs = await self.config.guild(ctx.guild).subreddits()
             subreddit = random.choice(subs) if subs else None
         else:
-            subreddit = subreddit.lstrip("r/").strip().lower()
+            subreddit = normalize_subreddit(subreddit)
             if not _SUBREDDIT_RE.match(subreddit):
                 await ctx.send(self._t(lang, "Ungültiger Subreddit-Name.", "Invalid subreddit name."))
                 return
@@ -440,7 +488,7 @@ class MemeGen(commands.Cog):
     async def m_subreddit(self, ctx: commands.Context, name: str) -> None:
         """Toggle a subreddit as a meme source (validated with a test fetch)."""
         lang = await self._lang(ctx.guild)
-        name = name.lstrip("r/").strip().lower()
+        name = normalize_subreddit(name)
         subs = await self.config.guild(ctx.guild).subreddits()
         if name in subs:
             async with self.config.guild(ctx.guild).subreddits() as subs_w:
@@ -539,7 +587,7 @@ class MemeGen(commands.Cog):
         if interval < 0:
             return SubmitResult.fail(tr_lang(lang, "Intervall darf nicht negativ sein.", "Interval must not be negative."))
         raw = str(data.get("subreddits") or "")
-        subs = [ln.strip().lstrip("r/").lower() for ln in raw.splitlines() if ln.strip()]
+        subs = [normalize_subreddit(ln) for ln in raw.splitlines() if ln.strip()]
         invalid = [s for s in subs if not _SUBREDDIT_RE.match(s)]
         if invalid:
             return SubmitResult.fail(tr_lang(

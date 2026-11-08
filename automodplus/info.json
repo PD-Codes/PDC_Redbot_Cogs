@@ -6,7 +6,9 @@
         "Domekologe"
     ],
     "required_cogs": {},
-    "requirements": [],
+    "requirements": [
+        "regex"
+    ],
     "tags": [
         "moderation",
         "automod",
@@ -20,5 +22,5 @@
     "disabled": false,
     "type": "COG",
     "install_msg": "Thanks for installing AutoModPlus!\n\nLoad it with `[p]load automodplus`, then configure rules via `[p]automodplus` (alias `[p]amp`) or the PDC web dashboard (if installed). All rules are disabled by default.",
-    "end_user_data_statement": "This cog does not persistently store any personal data. Spam detection uses transient in-memory counters (timestamps and content hashes) that are discarded on unload/restart. Message content is never persisted."
+    "end_user_data_statement": "This cog does not persistently store any personal data. Spam detection uses transient in-memory counters (timestamps and content hashes) that are discarded on unload/restart. Message content is never persisted. An active lockdown stores only channel IDs and their previous permission state (no user data)."
 }

@@ -16,9 +16,11 @@ from typing import List, Optional
 import io
 import csv
 import asyncio
+import json
 import os
 import re
 import uuid
+from urllib.parse import quote
 
 try:
     import aiohttp
@@ -38,6 +40,19 @@ from .pdc_dashboard import (
 )
 
 ONLINE_STATES = {discord.Status.online, discord.Status.idle, discord.Status.dnd}  # counted as online
+# Data retention / limits
+MAX_ACTIVE_ABSENCES_PER_USER = 20  # active + upcoming entries per member
+ABSENCE_RETENTION_DAYS = 365  # past absences older than this are pruned
+LAST_SEEN_RETENTION_DAYS = 365  # last_seen timestamps older than this are pruned
+CLEANUP_INTERVAL_SECONDS = 6 * 3600
+
+
+def csv_safe(value) -> str:
+    """Neutralise spreadsheet formula injection (=, +, -, @, tab, CR) in a CSV cell."""
+    text = "" if value is None else str(value)
+    if text and text[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + text
+    return text
 DATE_FORMATS = ["%d-%m-%Y", "%d.%m.%Y", "%d/%m/%Y", "%Y-%m-%d"]
 
 def _parse_date(s: str):
@@ -86,10 +101,9 @@ def _slugify_realm(s: str) -> str:
     return re.sub(r"-{2,}", "-", s).strip("-")
 
 def _slugify_char(s: str) -> str:
-    s = s.strip().lower()
-    s = (s.replace("ä","a").replace("ö","o").replace("ü","u").replace("ß","ss"))
-    s = re.sub(r"[^a-z0-9]+", "-", s)
-    return re.sub(r"-{2,}", "-", s).strip("-")
+    """Character names go to the Blizzard API in lowercase WITH their special
+    letters (umlauts etc.), URL-encoded - e.g. "Mäx" -> "m%C3%A4x"."""
+    return quote(s.strip().lower(), safe="")
 
 class GuildTools(commands.Cog):
     """Cog: Tools for WoW guilds - export, absences & /whois (ENV-first)."""
@@ -123,6 +137,7 @@ class GuildTools(commands.Cog):
         # Presence tracking buffer: guild_id -> {member_id(str): iso timestamp}
         self._presence_buffer: dict = {}
         self._presence_flush_task: Optional[asyncio.Task] = None
+        self._last_cleanup = 0.0
 
     async def cog_load(self) -> None:
         register_dashboard(self)
@@ -139,7 +154,8 @@ class GuildTools(commands.Cog):
             pass
 
     async def _presence_flush_loop(self) -> None:
-        """Flush buffered presence timestamps to the config every 60 seconds."""
+        """Flush buffered presence timestamps to the config every 60 seconds
+        and periodically prune old data (retention limits)."""
         try:
             while True:
                 await asyncio.sleep(60)
@@ -147,8 +163,69 @@ class GuildTools(commands.Cog):
                     await self._flush_presence_buffer()
                 except Exception:
                     pass
+                now = asyncio.get_running_loop().time()
+                if now - self._last_cleanup >= CLEANUP_INTERVAL_SECONDS:
+                    self._last_cleanup = now
+                    try:
+                        await self._cleanup_all()
+                    except Exception:
+                        pass
         except asyncio.CancelledError:
             pass
+
+    async def _cleanup_all(self) -> None:
+        """Prune last_seen entries and past absences beyond the retention period."""
+        now = datetime.now(timezone.utc)
+        seen_cutoff = now - timedelta(days=LAST_SEEN_RETENTION_DAYS)
+        abs_cutoff = (now - timedelta(days=ABSENCE_RETENTION_DAYS)).date()
+        for gid, gconf in (await self.config.all_guilds()).items():
+            if gconf.get("last_seen"):
+                async with self.config.guild_from_id(gid).last_seen() as data:
+                    for uid, ts in list(data.items()):
+                        try:
+                            dt = datetime.fromisoformat(str(ts))
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                        except ValueError:
+                            dt = None
+                        if dt is None or dt < seen_cutoff:
+                            data.pop(uid, None)
+            if gconf.get("absences"):
+                async with self._abs_lock:
+                    async with self.config.guild_from_id(gid).absences() as absences:
+                        absences[:] = [
+                            r for r in absences
+                            if (_from_iso(r.get("end")) or now.date()) >= abs_cutoff
+                        ]
+
+    # ---------- Red end-user data API ----------
+    async def red_delete_data_for_user(self, *, requester: str, user_id: int) -> None:
+        for gid, entries in self._presence_buffer.items():
+            entries.pop(str(user_id), None)
+        for gid, gconf in (await self.config.all_guilds()).items():
+            if str(user_id) in (gconf.get("last_seen") or {}):
+                async with self.config.guild_from_id(gid).last_seen() as data:
+                    data.pop(str(user_id), None)
+            if any(int(r.get("user_id", 0)) == user_id for r in gconf.get("absences") or []):
+                async with self._abs_lock:
+                    async with self.config.guild_from_id(gid).absences() as absences:
+                        absences[:] = [r for r in absences if int(r.get("user_id", 0)) != user_id]
+
+    async def red_get_data_for_user(self, *, user_id: int) -> dict:
+        out = {}
+        for gid, gconf in (await self.config.all_guilds()).items():
+            entry = {}
+            seen = (gconf.get("last_seen") or {}).get(str(user_id))
+            if seen:
+                entry["last_seen"] = seen
+            absences = [r for r in gconf.get("absences") or [] if int(r.get("user_id", 0)) == user_id]
+            if absences:
+                entry["absences"] = absences
+            if entry:
+                out[str(gid)] = entry
+        if not out:
+            return {}
+        return {"guildtools.json": io.BytesIO(json.dumps(out, indent=2).encode("utf-8"))}
 
     async def _flush_presence_buffer(self) -> None:
         if not self._presence_buffer:
@@ -171,6 +248,30 @@ class GuildTools(commands.Cog):
         if guild is None:
             return "en-US"
         return await self.config.guild(guild).language()
+
+    async def _deny_unless(self, interaction: discord.Interaction, tier: str) -> bool:
+        """Runtime permission check for slash commands (default_permissions can be
+        overridden by server admins). tier: "admin" (Manage Server / Red admin)
+        or "mod" (additionally Manage Messages / Red mod). Sends an ephemeral
+        error and returns True when the user is NOT allowed."""
+        user = interaction.user
+        allowed = await self.bot.is_owner(user)
+        perms = getattr(user, "guild_permissions", None)
+        if not allowed and interaction.guild is not None and perms is not None:
+            allowed = perms.administrator or perms.manage_guild or await self.bot.is_admin(user)
+            if not allowed and tier == "mod":
+                allowed = perms.manage_messages or await self.bot.is_mod(user)
+        if allowed:
+            return False
+        lang = await self._lang(interaction.guild)
+        if tier == "mod":
+            msg = tr_lang(lang, "Dafür brauchst du **Nachrichten verwalten** (Mod).",
+                          "You need **Manage Messages** (mod) to use this.")
+        else:
+            msg = tr_lang(lang, "Dafür brauchst du **Server verwalten** (Admin).",
+                          "You need **Manage Server** (admin) to use this.")
+        await interaction.response.send_message(msg, ephemeral=True)
+        return True
 
     async def _tz(self, guild):
         if guild is None:
@@ -234,6 +335,8 @@ class GuildTools(commands.Cog):
         became_offline = after.status is discord.Status.offline and before.status != after.status
         if not (became_online or became_offline):
             return
+        if await self.bot.cog_disabled_in_guild(self, after.guild):
+            return
         now_iso = datetime.now(timezone.utc).isoformat()
         # Buffer in memory; a background task flushes periodically to avoid
         # a full config write on every presence change.
@@ -243,11 +346,13 @@ class GuildTools(commands.Cog):
     @commands.hybrid_group(name="guildtoolsset", aliases=["gtset"])
     @commands.admin_or_permissions(manage_guild=True)
     @commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
     async def guildtoolsset(self, ctx: commands.Context) -> None:
         """Configure the GuildTools module."""
 
     @guildtoolsset.command(name="timezone", aliases=["tz"])
     @app_commands.describe(timezone_name="IANA timezone name, e.g. Europe/Berlin (default: UTC)")
+    @commands.admin_or_permissions(manage_guild=True)
     async def gts_timezone(self, ctx: commands.Context, timezone_name: str) -> None:
         """Set the guild timezone (IANA name) used for absence dates."""
         lang = await self._lang(ctx.guild)
@@ -269,6 +374,7 @@ class GuildTools(commands.Cog):
 
     @guildtoolsset.command(name="language")
     @app_commands.describe(language="Output language: de-DE or en-US")
+    @commands.admin_or_permissions(manage_guild=True)
     async def gts_language(self, ctx: commands.Context, language: str) -> None:
         """Set the output language for this server."""
         language = "de-DE" if language.lower().startswith("de") else "en-US"
@@ -299,6 +405,8 @@ class GuildTools(commands.Cog):
         status: Optional[app_commands.Choice[str]] = None,
     ):
         """Export the server's member list with optional filters."""
+        if await self._deny_unless(interaction, "admin"):
+            return
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
         lang = await self._lang(guild)
@@ -365,11 +473,11 @@ class GuildTools(commands.Cog):
         for m in members:
             w.writerow([
                 str(m.id),
-                m.name,
-                m.display_name,
-                ", ".join([r.name for r in m.roles if r.name != "@everyone"]) or "",
+                csv_safe(m.name),
+                csv_safe(m.display_name),
+                csv_safe(", ".join([r.name for r in m.roles if not r.is_default()])),
                 m.joined_at.astimezone(timezone.utc).isoformat() if m.joined_at else "",
-                last_seen_map.get(str(m.id), "unknown"),
+                csv_safe(last_seen_map.get(str(m.id), "unknown")),
             ])
         buf.seek(0)
         file = discord.File(io.BytesIO(buf.getvalue().encode("utf-8-sig")), filename=f"user_export_{guild.id}.csv")
@@ -454,6 +562,18 @@ class GuildTools(commands.Cog):
         existing = await self._get_absences(guild)
         new_start, new_end = start.date(), end.date()
 
+        today = datetime.now(await self._tz(guild)).date()
+        active = [
+            r for r in existing
+            if int(r.get("user_id", 0)) == interaction.user.id and (_from_iso(r.get("end")) or today) >= today
+        ]
+        if len(active) >= MAX_ACTIVE_ABSENCES_PER_USER:
+            return await interaction.response.send_message(tr_lang(
+                lang,
+                f"❌ Du hast bereits {MAX_ACTIVE_ABSENCES_PER_USER} aktive/geplante Abwesenheiten.",
+                f"❌ You already have {MAX_ACTIVE_ABSENCES_PER_USER} active/upcoming absences.",
+            ), ephemeral=True)
+
         # Conflict detection: warn about overlaps with the member's own entries.
         conflicts = []
         for rec in existing:
@@ -472,8 +592,9 @@ class GuildTools(commands.Cog):
             "end": _iso_date(end),
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
-        async with self.config.guild(guild).absences() as absences:
-            absences.append(record)
+        async with self._abs_lock:
+            async with self.config.guild(guild).absences() as absences:
+                absences.append(record)
 
         msg = tr_lang(
             lang,
@@ -544,6 +665,8 @@ class GuildTools(commands.Cog):
     @app_commands.default_permissions(manage_messages=True)
     async def get_absence(self, interaction: discord.Interaction, include_past: Optional[bool] = False):
         """Export the guild's absence list as CSV (mods and up)."""
+        if await self._deny_unless(interaction, "mod"):
+            return
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
         lang = await self._lang(guild)
@@ -568,11 +691,11 @@ class GuildTools(commands.Cog):
         for r in rows:
             w.writerow([
                 str(r.get("user_id", "")),
-                r.get("username", ""),
-                r.get("display_name", ""),
-                r.get("start", ""),
-                r.get("end", ""),
-                r.get("created_at", ""),
+                csv_safe(r.get("username", "")),
+                csv_safe(r.get("display_name", "")),
+                csv_safe(r.get("start", "")),
+                csv_safe(r.get("end", "")),
+                csv_safe(r.get("created_at", "")),
             ])
         buf.seek(0)
         file = discord.File(io.BytesIO(buf.getvalue().encode("utf-8-sig")), filename=f"absences_{guild.id}.csv")
@@ -703,6 +826,8 @@ class GuildTools(commands.Cog):
     @app_commands.default_permissions(manage_guild=True)
     async def set_wow_defaults(self, interaction: discord.Interaction, region: str, realm: str):
         """Set the default World of Warcraft region and realm for this server."""
+        if await self._deny_unless(interaction, "admin"):
+            return
         lang = await self._lang(interaction.guild)
         region = region.lower()
         if region not in {"eu", "us", "kr", "tw"}:
@@ -767,22 +892,40 @@ class GuildTools(commands.Cog):
 
         return token
 
+    async def _drop_token(self) -> None:
+        """Forget a token the API rejected (memory + config)."""
+        self._token_mem = ""
+        self._token_mem_exp = 0
+        await self.config.blizz_token.set("")
+        await self.config.blizz_token_expires_at.set(0)
+
     async def _get_profile(self, region: str, realm: str, charname: str, locale: str = "en_US"):
-        token = await self._get_token()
         realm_slug = _slugify_realm(realm)
         char_slug = _slugify_char(charname)
         base = f"https://{region}.api.blizzard.com"
         ns = f"profile-classic-{region}"
+        params = {"namespace": ns, "locale": locale}
+        prof_url = f"{base}/profile/wow/character/{realm_slug}/{char_slug}"
+        prof = None
+        for attempt in range(2):
+            token = await self._get_token()
+            headers = {"Authorization": f"Bearer {token}"}
+            async with aiohttp.ClientSession(headers=headers) as sess:
+                async with sess.get(prof_url, params=params) as r:
+                    if r.status == 401 and attempt == 0:
+                        # Token revoked/expired early: discard it and fetch a new one once.
+                        await self._drop_token()
+                        continue
+                    if r.status == 404:
+                        return None
+                    if r.status != 200:
+                        raise RuntimeError(f"Profile request failed ({r.status}).")
+                    prof = await r.json()
+            break
+        if prof is None:
+            raise RuntimeError("Profile request failed (401).")
         headers = {"Authorization": f"Bearer {token}"}
         async with aiohttp.ClientSession(headers=headers) as sess:
-            params = {"namespace": ns, "locale": locale}
-            prof_url = f"{base}/profile/wow/character/{realm_slug}/{char_slug}"
-            async with sess.get(prof_url, params=params) as r:
-                if r.status == 404:
-                    return None
-                if r.status != 200:
-                    raise RuntimeError(f"Profile request failed ({r.status}).")
-                prof = await r.json()
             equip_url = f"{base}/profile/wow/character/{realm_slug}/{char_slug}/equipment"
             ilvl = None
             async with sess.get(equip_url, params=params) as r2:

@@ -6,6 +6,7 @@ such as live logs). Methods are registered as ``async def handler(gateway, ctx, 
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 log = logging.getLogger("red.pdc.pdc_webdashboard.rpc")
@@ -46,6 +47,8 @@ class Dispatcher:
 
     async def dispatch(self, gateway: Any, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Processes a single JSON-RPC message and returns the response."""
+        if not isinstance(message, dict):
+            return _error(None, INVALID_REQUEST, "Ungültige JSON-RPC-2.0-Anfrage")
         req_id = message.get("id")
         is_notification = "id" not in message
 
@@ -54,6 +57,8 @@ class Dispatcher:
 
         method_name = message["method"]
         params = message.get("params") or {}
+        if not isinstance(params, dict):
+            return _error(req_id, INVALID_PARAMS, "params muss ein Objekt sein")
         handler = self._methods.get(method_name)
         if handler is None:
             return _error(req_id, METHOD_NOT_FOUND, f"Methode '{method_name}' unbekannt")
@@ -63,9 +68,13 @@ class Dispatcher:
         except RpcError as e:
             log.debug("RPC-Fehler bei %s: %s", method_name, e.message)
             return _error(req_id, e.code, e.message, e.data)
-        except Exception as e:  # pragma: no cover - defensive
-            log.exception("Interner Fehler bei Methode %s", method_name)
-            return _error(req_id, INTERNAL_ERROR, str(e))
+        except Exception:  # pragma: no cover - defensive
+            # SECURITY: never leak exception text (paths, internals) to the client.
+            # The client gets a generic message + an error id to correlate with the log.
+            error_id = uuid.uuid4().hex[:12]
+            log.exception("Interner Fehler bei Methode %s (error_id=%s)", method_name, error_id)
+            return _error(req_id, INTERNAL_ERROR, f"Interner Fehler (ID {error_id})",
+                          {"error_id": error_id})
 
         if is_notification:
             return None

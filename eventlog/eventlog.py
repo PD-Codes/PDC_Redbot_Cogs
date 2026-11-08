@@ -169,6 +169,8 @@ class EventLog(commands.Cog):
     ) -> None:
         if guild is None:
             return
+        if await self.bot.cog_disabled_in_guild(self, guild):
+            return
         conf = self.config.guild(guild)
         if not await conf.enabled():
             return
@@ -203,6 +205,8 @@ class EventLog(commands.Cog):
         """Cheap pre-check (enabled + event toggle) so listeners can skip
         expensive audit-log fetches early."""
         if guild is None:
+            return False
+        if await self.bot.cog_disabled_in_guild(self, guild):
             return False
         conf = self.config.guild(guild)
         if not await conf.enabled():
@@ -476,11 +480,13 @@ class EventLog(commands.Cog):
     @commands.hybrid_group(name="eventlog", aliases=["elog"])
     @commands.admin_or_permissions(manage_guild=True)
     @commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
     async def eventlog(self, ctx: commands.Context) -> None:
         """Configure event logging."""
 
     @eventlog.command(name="enable")
     @app_commands.describe(on_off="Enable or disable event logging")
+    @commands.admin_or_permissions(manage_guild=True)
     async def el_enable(self, ctx: commands.Context, on_off: bool) -> None:
         """Enable/disable the module for this server."""
         lang = await self.config.guild(ctx.guild).language()
@@ -490,6 +496,7 @@ class EventLog(commands.Cog):
 
     @eventlog.command(name="channel")
     @app_commands.describe(channel="Log channel")
+    @commands.admin_or_permissions(manage_guild=True)
     async def el_channel(self, ctx: commands.Context, channel: discord.TextChannel) -> None:
         """Set the log channel."""
         lang = await self.config.guild(ctx.guild).language()
@@ -498,6 +505,7 @@ class EventLog(commands.Cog):
 
     @eventlog.command(name="event")
     @app_commands.describe(event="Event type", on_off="Enable or disable this event")
+    @commands.admin_or_permissions(manage_guild=True)
     async def el_event(self, ctx: commands.Context, event: str, on_off: bool) -> None:
         """Toggle a single event type (joins, leaves, msg_edit, msg_delete, roles, nicknames, voice, channels, threads, bans)."""
         lang = await self.config.guild(ctx.guild).language()
@@ -511,6 +519,7 @@ class EventLog(commands.Cog):
 
     @eventlog.command(name="ignorebots")
     @app_commands.describe(on_off="Ignore actions performed by bots")
+    @commands.admin_or_permissions(manage_guild=True)
     async def el_ignorebots(self, ctx: commands.Context, on_off: bool) -> None:
         """Ignore bot joins/leaves and other bot actions."""
         lang = await self.config.guild(ctx.guild).language()
@@ -525,6 +534,7 @@ class EventLog(commands.Cog):
 
     @eventlog.command(name="retention")
     @app_commands.describe(days="Retention note in days (0 disables the note)")
+    @commands.admin_or_permissions(manage_guild=True)
     async def el_retention(self, ctx: commands.Context, days: commands.Range[int, 0, 365]) -> None:
         """Set an informational retention note added to log embeds.
 
@@ -539,6 +549,7 @@ class EventLog(commands.Cog):
             await ctx.send(self._t(lang, "Aufbewahrungshinweis deaktiviert.", "Retention note disabled."))
 
     @eventlog.command(name="status")
+    @commands.admin_or_permissions(manage_guild=True)
     async def el_status(self, ctx: commands.Context) -> None:
         """Show the current configuration."""
         lang = await self.config.guild(ctx.guild).language()
@@ -565,6 +576,7 @@ class EventLog(commands.Cog):
 
     @eventlog.command(name="recent")
     @app_commands.describe(event="Optional event type filter", count="How many entries (max 100)")
+    @commands.admin_or_permissions(manage_guild=True)
     async def el_recent(
         self,
         ctx: commands.Context,
@@ -610,6 +622,7 @@ class EventLog(commands.Cog):
 
     @eventlog.command(name="language")
     @app_commands.describe(language="Output language: de-DE or en-US")
+    @commands.admin_or_permissions(manage_guild=True)
     async def el_language(self, ctx: commands.Context, language: str) -> None:
         """Set the output language for this server (default: en-US)."""
         language = "de-DE" if language.lower().startswith("de") else "en-US"

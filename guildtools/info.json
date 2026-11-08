@@ -6,7 +6,7 @@
     "name": "GuildTools",
     "short": "Slash/Hybrid Tools for Guilds",
     "description": "Assorted tools for our guilds (whois, absences, ready-times, exports).",
-    "end_user_data_statement": "This cog does not store any personal user data.",
+    "end_user_data_statement": "This cog stores, per server: the last time a member was seen online (Discord user ID + timestamp, pruned after 365 days), absence entries members add themselves (user ID, username, display name, dates; past entries pruned after 365 days, max 20 active per member) and weekly ready times members set themselves. Users can request export or deletion of their data via Red's end-user data commands.",
     "tags": [
         "guild",
         "tools"

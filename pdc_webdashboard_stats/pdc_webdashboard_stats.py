@@ -17,6 +17,7 @@ import csv
 import io
 import json
 import logging
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -31,6 +32,7 @@ log = logging.getLogger("red.pdc.pdc_webdashboard_stats")
 RETENTION_DAYS = 400          # default: how long daily buckets are kept (configurable)
 SAMPLE_MINUTES = 30           # default: interval of the status/activity snapshots (configurable)
 STATUS_SAMPLE_DAYS = 60       # how many days of status samples are kept
+FLUSH_INTERVAL_S = 300        # buffered counters are written at most every 5 min (forced on unload)
 
 
 def _utcnow() -> datetime:
@@ -106,6 +108,12 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
         # Cached copies of the global settings (loaded in cog_load).
         self._retention_days: int = RETENTION_DAYS
         self._sample_minutes: int = SAMPLE_MINUTES
+        # PERFORMANCE: buffered counters are written only when dirty and at most
+        # every FLUSH_INTERVAL_S; all writes touch single day buckets (get_raw /
+        # set_raw) instead of re-serialising the whole 400-day per-member stores.
+        self._last_flush: float = time.monotonic()
+        # Serialises read-modify-write of day buckets (flush, bumps, prune, deletion).
+        self._write_lock = asyncio.Lock()
         self._snapshot_loop.start()
         self._flush_loop.start()
 
@@ -160,23 +168,31 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
     # ------------------------------------------------------------------ #
     # Write helpers
     # ------------------------------------------------------------------ #
+    @staticmethod
+    async def _merge_day(scope: Any, group: str, dk: str, items: Dict[str, float]) -> None:
+        """Add counters into ONE day bucket of ``group`` (per-key read/write).
+
+        Same stored layout as before ({daykey: {key: value}}), but only the one
+        day is read and written instead of the whole multi-hundred-day store.
+        Callers must hold ``self._write_lock``.
+        """
+        if not items:
+            return
+        grp = getattr(scope, group)
+        day = await grp.get_raw(dk, default={})
+        if not isinstance(day, dict):
+            day = {}
+        for k, n in items.items():
+            day[k] = day.get(k, 0) + n
+        await grp.set_raw(dk, value=day)
+
     async def _bump_day(self, guild: discord.Guild, field: str, amount: float = 1) -> None:
-        key = _daykey()
-        async with self.config.guild(guild).days() as days:
-            d = days.get(key)
-            if not isinstance(d, dict):
-                d = {}
-            d[field] = d.get(field, 0) + amount
-            days[key] = d
+        async with self._write_lock:
+            await self._merge_day(self.config.guild(guild), "days", _daykey(), {field: amount})
 
     async def _bump_nested(self, guild: discord.Guild, group: str, sub: str, amount: float = 1) -> None:
-        key = _daykey()
-        async with getattr(self.config.guild(guild), group)() as data:
-            day = data.get(key)
-            if not isinstance(day, dict):
-                day = {}
-            day[sub] = day.get(sub, 0) + amount
-            data[key] = day
+        async with self._write_lock:
+            await self._merge_day(self.config.guild(guild), group, _daykey(), {sub: amount})
 
     # ------------------------------------------------------------------ #
     # Listener: messages
@@ -233,112 +249,67 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
         except Exception:
             pass
 
-    async def _flush(self) -> None:
-        """Writes buffered message, command and voice counters to the config in a batch."""
+    async def _flush(self, force: bool = False) -> None:
+        """Writes buffered message, command and voice counters to the config in a batch.
+
+        Only runs when something is buffered (dirty) and at most every
+        ``FLUSH_INTERVAL_S`` seconds unless ``force`` (unload / data requests).
+        """
         if not self._msg_buf and not self._cmd_buf and not self._voice_buf:
             return
-        buf = self._msg_buf
-        self._msg_buf = {}
-        by_guild: Dict[int, list] = {}
-        for (gid, dk), e in buf.items():
-            by_guild.setdefault(gid, []).append((dk, e))
-        for gid, entries in by_guild.items():
-            guild = self.bot.get_guild(gid)
-            if guild is None:
-                continue
-            try:
-                self._enabled_cache[gid] = bool(await self.config.guild(guild).enabled())
-            except Exception:
-                pass
-            try:
-                async with self.config.guild(guild).days() as days:
-                    for dk, e in entries:
-                        d = days.get(dk) if isinstance(days.get(dk), dict) else {}
-                        d["messages"] = d.get("messages", 0) + e["messages"]
-                        days[dk] = d
-                async with self.config.guild(guild).msg_channels() as mc:
-                    for dk, e in entries:
-                        day = mc.get(dk) if isinstance(mc.get(dk), dict) else {}
-                        for cid, n in e["channels"].items():
-                            day[cid] = day.get(cid, 0) + n
-                        mc[dk] = day
-                async with self.config.guild(guild).msg_members() as mm:
-                    for dk, e in entries:
-                        day = mm.get(dk) if isinstance(mm.get(dk), dict) else {}
-                        for mid, n in e["members"].items():
-                            day[mid] = day.get(mid, 0) + n
-                        mm[dk] = day
-                async with self.config.guild(guild).msg_hourly() as mh:
-                    for dk, e in entries:
-                        day = mh.get(dk) if isinstance(mh.get(dk), dict) else {}
-                        for hr, n in (e.get("hours") or {}).items():
-                            day[hr] = day.get(hr, 0) + n
-                        mh[dk] = day
-            except Exception:
-                log.debug("flush failed for guild %s", gid, exc_info=True)
+        if not force and time.monotonic() - self._last_flush < FLUSH_INTERVAL_S:
+            return
+        self._last_flush = time.monotonic()
+        async with self._write_lock:
+            buf, self._msg_buf = self._msg_buf, {}
+            cbuf, self._cmd_buf = self._cmd_buf, {}
+            vbuf, self._voice_buf = self._voice_buf, {}
 
-        # Batch command counters (separate buffer; a guild can have commands without messages).
-        if self._cmd_buf:
-            cbuf = self._cmd_buf
-            self._cmd_buf = {}
-            by_g: Dict[int, list] = {}
-            for (gid, dk), e in cbuf.items():
-                by_g.setdefault(gid, []).append((dk, e))
-            for gid, entries in by_g.items():
+            for gid in {g for g, _ in buf}:
                 guild = self.bot.get_guild(gid)
                 if guild is None:
                     continue
                 try:
-                    async with self.config.guild(guild).commands() as cmds:
-                        for dk, e in entries:
-                            day = cmds.get(dk) if isinstance(cmds.get(dk), dict) else {}
-                            for nm, n in e["cmds"].items():
-                                day[nm] = day.get(nm, 0) + n
-                            cmds[dk] = day
-                    async with self.config.guild(guild).command_errors() as errs:
-                        for dk, e in entries:
-                            day = errs.get(dk) if isinstance(errs.get(dk), dict) else {}
-                            for nm, n in e["errs"].items():
-                                day[nm] = day.get(nm, 0) + n
-                            errs[dk] = day
+                    self._enabled_cache[gid] = bool(await self.config.guild(guild).enabled())
+                except Exception:
+                    pass
+
+            for (gid, dk), e in buf.items():
+                guild = self.bot.get_guild(gid)
+                if guild is None:
+                    continue
+                scope = self.config.guild(guild)
+                try:
+                    await self._merge_day(scope, "days", dk, {"messages": e["messages"]})
+                    await self._merge_day(scope, "msg_channels", dk, e["channels"])
+                    await self._merge_day(scope, "msg_members", dk, e["members"])
+                    await self._merge_day(scope, "msg_hourly", dk, e.get("hours") or {})
+                except Exception:
+                    log.debug("flush failed for guild %s", gid, exc_info=True)
+
+            # Command counters (separate buffer; a guild can have commands without messages).
+            for (gid, dk), e in cbuf.items():
+                guild = self.bot.get_guild(gid)
+                if guild is None:
+                    continue
+                scope = self.config.guild(guild)
+                try:
+                    await self._merge_day(scope, "commands", dk, e["cmds"])
+                    await self._merge_day(scope, "command_errors", dk, e["errs"])
                 except Exception:
                     log.debug("cmd flush failed for guild %s", gid, exc_info=True)
 
-        # Batch voice minutes (buffered by the voice listeners/tick).
-        if self._voice_buf:
-            vbuf = self._voice_buf
-            self._voice_buf = {}
-            by_gv: Dict[int, list] = {}
+            # Voice minutes (buffered by the voice listeners/tick).
             for (gid, dk), e in vbuf.items():
-                by_gv.setdefault(gid, []).append((dk, e))
-            for gid, entries in by_gv.items():
                 guild = self.bot.get_guild(gid)
                 if guild is None:
                     continue
+                scope = self.config.guild(guild)
                 try:
-                    async with self.config.guild(guild).days() as days:
-                        for dk, e in entries:
-                            d = days.get(dk) if isinstance(days.get(dk), dict) else {}
-                            d["voice_minutes"] = d.get("voice_minutes", 0) + e["minutes"]
-                            days[dk] = d
-                    async with self.config.guild(guild).voice_channels() as vc:
-                        for dk, e in entries:
-                            day = vc.get(dk) if isinstance(vc.get(dk), dict) else {}
-                            for cid, n in e["channels"].items():
-                                day[cid] = day.get(cid, 0) + n
-                            vc[dk] = day
-                    async with self.config.guild(guild).voice_members() as vm:
-                        for dk, e in entries:
-                            day = vm.get(dk) if isinstance(vm.get(dk), dict) else {}
-                            for mid, n in e["members"].items():
-                                day[mid] = day.get(mid, 0) + n
-                            vm[dk] = day
-                    async with self.config.guild(guild).voice_hourly() as vh:
-                        for dk, e in entries:
-                            day = vh.get(dk) if isinstance(vh.get(dk), dict) else {}
-                            for hr, n in e["hours"].items():
-                                day[hr] = day.get(hr, 0) + n
-                            vh[dk] = day
+                    await self._merge_day(scope, "days", dk, {"voice_minutes": e["minutes"]})
+                    await self._merge_day(scope, "voice_channels", dk, e["channels"])
+                    await self._merge_day(scope, "voice_members", dk, e["members"])
+                    await self._merge_day(scope, "voice_hourly", dk, e["hours"])
                 except Exception:
                     log.debug("voice flush failed for guild %s", gid, exc_info=True)
 
@@ -354,7 +325,7 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
                 except Exception:
                     pass
         try:
-            await self._flush()
+            await self._flush(force=True)
         except Exception:
             pass
 
@@ -600,15 +571,18 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
                     })
                     del samples[:-self._status_retention]
                 # Peak concurrency per day (max online + max in voice).
-                async with self.config.guild(guild).peaks() as pk:
-                    day = pk.get(key) if isinstance(pk.get(key), dict) else {}
+                gscope = self.config.guild(guild)
+                async with self._write_lock:
+                    day = await gscope.peaks.get_raw(key, default={})
+                    day = day if isinstance(day, dict) else {}
                     day["on_max"] = max(int(day.get("on_max", 0)), on)
                     day["voice_max"] = max(int(day.get("voice_max", 0)), voice_now)
-                    pk[key] = day
+                    await gscope.peaks.set_raw(key, value=day)
                 # Activity per kind (each snapshot ≈ one sample interval per active member).
                 if any(kinds.values()):
-                    async with self.config.guild(guild).activities() as actk:
-                        day = actk.get(key) if isinstance(actk.get(key), dict) else {}
+                    async with self._write_lock:
+                        day = await gscope.activities.get_raw(key, default={})
+                        day = day if isinstance(day, dict) else {}
                         for kind, names in kinds.items():
                             if not names:
                                 continue
@@ -616,14 +590,13 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
                             for nm, count in names.items():
                                 kd[nm] = kd.get(nm, 0) + count * self._sample_minutes
                             day[kind] = kd
-                        actk[key] = day
+                        await gscope.activities.set_raw(key, value=day)
                 # Legacy 'activity' store (playing only) – kept for backward compatibility.
                 if kinds["playing"]:
-                    async with self.config.guild(guild).activity() as act_store:
-                        day = act_store.get(key) if isinstance(act_store.get(key), dict) else {}
-                        for nm, count in kinds["playing"].items():
-                            day[nm] = day.get(nm, 0) + count * self._sample_minutes
-                        act_store[key] = day
+                    async with self._write_lock:
+                        await self._merge_day(gscope, "activity", key, {
+                            nm: count * self._sample_minutes for nm, count in kinds["playing"].items()
+                        })
                 # Prune only once per day per guild instead of on every snapshot.
                 if self._last_prune.get(guild.id) != key:
                     await self._prune(guild)
@@ -633,19 +606,26 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
 
     async def _set_day(self, guild: discord.Guild, field: str, value: float) -> None:
         key = _daykey()
-        async with self.config.guild(guild).days() as days:
-            d = days.get(key) if isinstance(days.get(key), dict) else {}
+        grp = self.config.guild(guild).days
+        async with self._write_lock:
+            d = await grp.get_raw(key, default={})
+            d = d if isinstance(d, dict) else {}
             d[field] = value
-            days[key] = d
+            await grp.set_raw(key, value=d)
 
     async def _prune(self, guild: discord.Guild) -> None:
+        """Drop day buckets older than the retention period (writes only if needed)."""
         cutoff = _daykey(_utcnow() - timedelta(days=self._retention_days))
-        for group in ("days", "msg_channels", "msg_members", "voice_channels", "voice_members",
-                      "activity", "invite_daily", "commands", "command_errors",
-                      "msg_hourly", "voice_hourly", "peaks", "activities"):
-            async with getattr(self.config.guild(guild), group)() as data:
-                for k in [k for k in data.keys() if k < cutoff]:
-                    data.pop(k, None)
+        async with self._write_lock:
+            for group in ("days", "msg_channels", "msg_members", "voice_channels", "voice_members",
+                          "activity", "invite_daily", "commands", "command_errors",
+                          "msg_hourly", "voice_hourly", "peaks", "activities"):
+                grp = getattr(self.config.guild(guild), group)
+                data = await grp()
+                if not isinstance(data, dict):
+                    continue
+                if any(k < cutoff for k in data.keys()):
+                    await grp.set({k: v for k, v in data.items() if k >= cutoff})
 
     @tasks.loop(minutes=SAMPLE_MINUTES)
     async def _snapshot_loop(self) -> None:
@@ -725,6 +705,25 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
                         "value": round(val, 2) if isinstance(val, float) else val})
         return out
 
+    @staticmethod
+    def _visible_channel_ids(guild: discord.Guild, viewer: Optional[discord.Member]) -> Optional[set]:
+        """IDs (str) of channels/threads ``viewer`` can see; ``None`` = no filter.
+
+        PRIVACY: the dashboard passes the requesting member so names/activity of
+        channels they cannot view (private channels) are never exposed.
+        """
+        if viewer is None:
+            return None
+        visible: set = set()
+        chans = list(getattr(guild, "channels", []) or []) + list(getattr(guild, "threads", []) or [])
+        for ch in chans:
+            try:
+                if ch.permissions_for(viewer).view_channel:
+                    visible.add(str(ch.id))
+            except Exception:
+                continue
+        return visible
+
     async def stats_overview(self, guild: discord.Guild, days: int = 30) -> Dict[str, Any]:
         keys = self._range_keys(days)
         daysd = await self.config.guild(guild).days()
@@ -761,7 +760,9 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
             },
         }
 
-    async def stats_messages(self, guild: discord.Guild, days: int = 30) -> Dict[str, Any]:
+    async def stats_messages(
+        self, guild: discord.Guild, days: int = 30, *, viewer: Optional[discord.Member] = None
+    ) -> Dict[str, Any]:
         keys = self._range_keys(days)
         daysd = await self.config.guild(guild).days()
         ch = await self.config.guild(guild).msg_channels()
@@ -777,6 +778,10 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
             for mid, c in (mem.get(k, {}) or {}).items():
                 mem_tot[mid] += c
                 uniq_mem.add(mid)
+        vis = self._visible_channel_ids(guild, viewer)
+        if vis is not None:
+            ch_tot = {c: v for c, v in ch_tot.items() if c in vis}
+            uniq_ch = {c for c in uniq_ch if c in vis}
         return {
             "labels": keys, "values": series, "total": sum(series),
             "unique_members": len(uniq_mem), "unique_channels": len(uniq_ch),
@@ -797,7 +802,9 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
                 out.append((str(ch_id), str(mid), mins))
         return out
 
-    async def stats_voice(self, guild: discord.Guild, days: int = 30) -> Dict[str, Any]:
+    async def stats_voice(
+        self, guild: discord.Guild, days: int = 30, *, viewer: Optional[discord.Member] = None
+    ) -> Dict[str, Any]:
         keys = self._range_keys(days)
         daysd = await self.config.guild(guild).days()
         ch = await self.config.guild(guild).voice_channels()
@@ -825,6 +832,10 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
             uniq_mem.add(mid)
         if live_h and keys and keys[-1] == today:
             series[-1] = round(series[-1] + live_h, 2)
+        vis = self._visible_channel_ids(guild, viewer)
+        if vis is not None:
+            ch_tot = {c: v for c, v in ch_tot.items() if c in vis}
+            uniq_ch = {c for c in uniq_ch if c in vis}
         return {
             "labels": keys, "values": series, "total": round(sum(series), 2),
             "unique_members": len(uniq_mem), "unique_channels": len(uniq_ch),
@@ -914,7 +925,9 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
             "kinds": {kind: top(d) for kind, d in kinds.items()},
         }
 
-    async def _entity_options(self, guild: discord.Guild, groups, kind: str) -> List[Dict[str, str]]:
+    async def _entity_options(
+        self, guild: discord.Guild, groups, kind: str, allowed: Optional[set] = None
+    ) -> List[Dict[str, str]]:
         # `groups` may be a single store name or several – members/channels with
         # only VOICE activity (no messages) should also appear in the dropdown.
         if isinstance(groups, str):
@@ -924,7 +937,8 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
             data = await getattr(self.config.guild(guild), group)()
             for day in (data or {}).values():
                 for _id, c in (day or {}).items():
-                    tot[_id] += c
+                    if allowed is None or _id in allowed:
+                        tot[_id] += c
         return [{"id": e["id"], "name": e["name"]} for e in self._top(guild, tot, kind, limit=200)]
 
     async def stats_commands(self, guild: discord.Guild, days: int = 30) -> Dict[str, Any]:
@@ -963,11 +977,19 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
         share = round((val / total_sum) * 100, 1) if total_sum else 0
         return {"rank": rank, "of": len(ordered), "share": share}
 
-    async def stats_member_drilldown(self, guild: discord.Guild, member_id: int, days: int = 30) -> Dict[str, Any]:
+    async def stats_member_drilldown(
+        self, guild: discord.Guild, member_id: int, days: int = 30, *, own_only: bool = False
+    ) -> Dict[str, Any]:
+        """Detail view of one member. ``own_only`` (regular members): the dropdown
+        only offers ``member_id`` itself – no list of other members."""
         keys = self._range_keys(days)
         mem = await self.config.guild(guild).msg_members()
         vmem = await self.config.guild(guild).voice_members()
-        options = await self._entity_options(guild, ("msg_members", "voice_members"), "member")
+        if own_only:
+            me = guild.get_member(int(member_id)) if member_id else None
+            options = [{"id": str(member_id), "name": me.display_name if me else str(member_id)}]
+        else:
+            options = await self._entity_options(guild, ("msg_members", "voice_members"), "member")
         if not member_id and options:
             member_id = int(options[0]["id"])
         mid = str(member_id)
@@ -1004,11 +1026,17 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
             "meta": meta,
         }
 
-    async def stats_channel_drilldown(self, guild: discord.Guild, channel_id: int, days: int = 30) -> Dict[str, Any]:
+    async def stats_channel_drilldown(
+        self, guild: discord.Guild, channel_id: int, days: int = 30,
+        *, viewer: Optional[discord.Member] = None,
+    ) -> Dict[str, Any]:
         keys = self._range_keys(days)
         ch = await self.config.guild(guild).msg_channels()
         vch = await self.config.guild(guild).voice_channels()
-        options = await self._entity_options(guild, ("msg_channels", "voice_channels"), "channel")
+        vis = self._visible_channel_ids(guild, viewer)
+        options = await self._entity_options(guild, ("msg_channels", "voice_channels"), "channel", vis)
+        if vis is not None and channel_id and str(channel_id) not in vis:
+            channel_id = 0  # not viewable -> fall back to the first visible channel
         if not channel_id and options:
             channel_id = int(options[0]["id"])
         cid = str(channel_id)
@@ -1017,7 +1045,8 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
         msg_tot: Dict[str, float] = defaultdict(float)
         for k in keys:
             for _id, n in (ch.get(k, {}) or {}).items():
-                msg_tot[_id] += n
+                if vis is None or _id in vis:
+                    msg_tot[_id] += n
         c = guild.get_channel(int(channel_id)) if channel_id else None
         return {
             "labels": keys, "messages": msgs, "voice_hours": voice,
@@ -1073,7 +1102,7 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
             "peak_voice": max(voice_series, default=0),
         }
 
-    async def stats_now(self, guild: discord.Guild) -> Dict[str, Any]:
+    async def stats_now(self, guild: discord.Guild, *, viewer: Optional[discord.Member] = None) -> Dict[str, Any]:
         """Live snapshot: current online counts, who is in voice, what is being played."""
         on = idle = dnd = off = 0
         playing: Dict[str, int] = defaultdict(int)
@@ -1095,7 +1124,10 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
                     if nm:
                         playing[nm] += 1
         voice_members = []
+        vis = self._visible_channel_ids(guild, viewer)
         for vc in guild.voice_channels:
+            if vis is not None and str(vc.id) not in vis:
+                continue
             for vm in vc.members:
                 if not vm.bot:
                     voice_members.append({"name": vm.display_name, "channel": vc.name})
@@ -1247,6 +1279,92 @@ class WebDashboardStats(commands.Cog, name="pdc_webdashboard_stats"):
             "mimetype": "application/json",
             "content": json.dumps(payload, ensure_ascii=False, indent=2),
         }
+
+    # ================================================================== #
+    # Red end-user data API
+    # ================================================================== #
+    async def red_get_data_for_user(self, *, user_id: int) -> Dict[str, io.BytesIO]:
+        """All stored data referencing ``user_id`` (per guild)."""
+        try:
+            await self._flush(force=True)
+        except Exception:
+            log.debug("flush before data export failed", exc_info=True)
+        uid = str(user_id)
+        out: Dict[str, Any] = {}
+        all_guilds = await self.config.all_guilds()
+        for gid, data in all_guilds.items():
+            entry: Dict[str, Any] = {}
+            for group in ("msg_members", "voice_members"):
+                store = data.get(group)
+                if not isinstance(store, dict):
+                    continue
+                per_day = {dk: day[uid] for dk, day in store.items() if isinstance(day, dict) and uid in day}
+                if per_day:
+                    entry[group] = per_day
+            logs = [e for e in (data.get("invite_logs") or [])
+                    if isinstance(e, dict) and str(e.get("user_id")) == uid]
+            if logs:
+                entry["invite_logs"] = logs
+            im = data.get("invite_members")
+            if isinstance(im, dict) and uid in im:
+                entry["invite_members"] = im[uid]
+            inv = data.get("invites")
+            if isinstance(inv, dict):
+                codes = [c for c, e in inv.items() if isinstance(e, dict) and str(e.get("inviter_id")) == uid]
+                if codes:
+                    entry["invites_created"] = codes
+            if entry:
+                out[str(gid)] = entry
+        if not out:
+            return {}
+        payload = {"user_id": uid, "guilds": out}
+        return {
+            "user_data.json": io.BytesIO(json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
+        }
+
+    async def red_delete_data_for_user(self, *, requester: str, user_id: int) -> None:
+        """Remove every occurrence of ``user_id`` (all requester types)."""
+        uid = str(user_id)
+        # In-memory buffers / open voice sessions first (not yet written).
+        for e in list(self._msg_buf.values()):
+            e.get("members", {}).pop(uid, None)
+        for e in list(self._voice_buf.values()):
+            e.get("members", {}).pop(uid, None)
+        for key in [k for k in list(self._voice.keys()) if k[1] == int(user_id)]:
+            self._voice.pop(key, None)
+        async with self._write_lock:
+            all_guilds = await self.config.all_guilds()
+            for gid, data in all_guilds.items():
+                scope = self.config.guild_from_id(int(gid))
+                for group in ("msg_members", "voice_members"):
+                    store = data.get(group)
+                    if not isinstance(store, dict):
+                        continue
+                    changed = False
+                    for day in store.values():
+                        if isinstance(day, dict) and uid in day:
+                            day.pop(uid, None)
+                            changed = True
+                    if changed:
+                        await getattr(scope, group).set(store)
+                logs = data.get("invite_logs")
+                if isinstance(logs, list):
+                    kept = [e for e in logs if not (isinstance(e, dict) and str(e.get("user_id")) == uid)]
+                    if len(kept) != len(logs):
+                        await scope.invite_logs.set(kept)
+                im = data.get("invite_members")
+                if isinstance(im, dict) and uid in im:
+                    im.pop(uid, None)
+                    await scope.invite_members.set(im)
+                inv = data.get("invites")
+                if isinstance(inv, dict):
+                    changed = False
+                    for e in inv.values():
+                        if isinstance(e, dict) and str(e.get("inviter_id")) == uid:
+                            e["inviter_id"] = 0
+                            changed = True
+                    if changed:
+                        await scope.invites.set(inv)
 
     # ================================================================== #
     # Commands

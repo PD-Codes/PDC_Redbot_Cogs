@@ -13,8 +13,10 @@ Discord OAuth2 login. Permissions are re-checked here on the server side.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
+import uuid
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -83,7 +85,11 @@ async def _build_context(gateway: Any, params: Dict[str, Any]) -> DashboardConte
     member = None
     gid = auth.get("guild_id")
     if gid:
-        guild = bot.get_guild(int(gid))
+        try:
+            gid_int = int(gid)
+        except (TypeError, ValueError):
+            raise RpcError(INVALID_PARAMS, "Ungültige guild_id")
+        guild = bot.get_guild(gid_int)
         if guild is not None:
             member = guild.get_member(uid)
 
@@ -97,17 +103,29 @@ async def _build_context(gateway: Any, params: Dict[str, Any]) -> DashboardConte
     )
 
 
+def _internal_error(message: str) -> RpcError:
+    """RpcError for an unexpected exception: the client only gets ``message`` plus
+    an error id; the exception details (call inside an ``except`` block) go to the log."""
+    error_id = uuid.uuid4().hex[:12]
+    log.exception("%s (error_id=%s)", message, error_id)
+    return RpcError(INTERNAL_ERROR, f"{message} (ID {error_id})", {"error_id": error_id})
+
+
+async def _is_locked_for(gateway: Any, ctx: DashboardContext) -> bool:
+    """True if the dashboard is locked and ``ctx.user`` is not the bot owner."""
+    cog = gateway.bot.get_cog("pdc_webdashboard") or gateway.bot.get_cog("WebDashboard")
+    if cog is None:
+        return False
+    try:
+        return bool(await cog.config.locked()) and not await gateway.bot.is_owner(ctx.user)
+    except Exception:
+        return False
+
+
 async def _require(gateway: Any, ctx: DashboardContext, permission: str) -> None:
     # Lock: if the dashboard is locked, only the bot owner may run protected calls.
-    cog = gateway.bot.get_cog("pdc_webdashboard") or gateway.bot.get_cog("WebDashboard")
-    if cog is not None:
-        try:
-            if await cog.config.locked() and not await gateway.bot.is_owner(ctx.user):
-                raise RpcError(FORBIDDEN, "Dashboard ist gesperrt")
-        except RpcError:
-            raise
-        except Exception:
-            pass
+    if await _is_locked_for(gateway, ctx):
+        raise RpcError(FORBIDDEN, "Dashboard ist gesperrt")
     # SECURITY: Any guild context requires at least membership – even if the
     # contribution only requires "authenticated". Otherwise logged-in non-members
     # could read content of other servers by manipulating the guild_id.
@@ -550,7 +568,15 @@ async def core_commands(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
                             cands.append(ac)
                 except Exception:
                     continue
+                # Groups (e.g. hybrid /wowt) are not invocable themselves: list their
+                # leaf commands ("wowt charinfo"), like step 1 does via walk_commands().
+                leaves = []
                 for ac in cands:
+                    if isinstance(ac, app_commands.Group):
+                        leaves += [x for x in ac.walk_commands() if isinstance(x, app_commands.Command)]
+                    else:
+                        leaves.append(ac)
+                for ac in leaves:
                     name = getattr(ac, "qualified_name", None) or getattr(ac, "name", None)
                     if not name or name in slash_names:
                         continue
@@ -647,6 +673,10 @@ async def core_stats(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
 async def manifest_get(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     """Returns all contributions the user is allowed to see (filtered by permissions)."""
     ctx = await _build_context(gateway, params)
+    # Lock: like every other protected call – only the bot owner sees anything.
+    # Same response shape as the non-member case (+ additive "locked" flag).
+    if await _is_locked_for(gateway, ctx):
+        return {"contributions": [], "locked": True}
     # Resolve the permission level only ONCE and then compare (instead of an
     # expensive resolution per contribution – saves many config reads with many cogs).
     level = await resolve_level(gateway.bot, ctx.user, ctx.guild)
@@ -797,7 +827,19 @@ async def cogs_list(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
         available = set(await bot._cog_mgr.available_modules())
     except Exception:
         available = set(loaded)
-    contributing = {c.cog_name.lower() for c in gateway.registry.all()}
+    # Registry keys are CLASS names (e.g. "WoWTools"), bot.extensions keys are
+    # PACKAGE names (e.g. "wowtools_classic"). Map each registered cog instance
+    # to its package (top-level module of its class) and keep the class name
+    # as a fallback for cogs whose package equals the class name.
+    contributing = set()
+    for c in gateway.registry.all():
+        contributing.add(str(c.cog_name).lower())
+        try:
+            mod = str(getattr(type(c.cog), "__module__", "") or "")
+            if mod:
+                contributing.add(mod.split(".")[0].lower())
+        except Exception:
+            pass
     repo_map = await _repo_map(bot)  # package name (lowercase) -> repo name
     names = sorted(available | loaded)
     cogs = [
@@ -946,8 +988,8 @@ async def cogs_set(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
                     pkgs.remove(name)
     except RpcError:
         raise
-    except Exception as e:  # cleanly pass through Red/import errors
-        raise RpcError(INTERNAL_ERROR, f"{action} fehlgeschlagen: {e}")
+    except Exception:  # cleanly pass through Red/import errors
+        raise _internal_error(f"{action} fehlgeschlagen")
 
     gateway.audit(f"cogs.{action}", ctx, {"name": name})
     return {"ok": True, "name": name, "loaded": name in bot.extensions}
@@ -956,6 +998,16 @@ async def cogs_set(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Slash/app command management (bot owner only)
 # --------------------------------------------------------------------------- #
+async def _red_check_enabled(bot: Any) -> None:
+    """Apply Red's enabled/disabled app-command config to the tree, exactly like
+    Red's own ``[p]slash enable/disable/sync`` do. Without this, toggles made in the
+    dashboard only reach the tree after a cog reload and a sync pushes a stale set
+    (e.g. freshly enabled ``/wowt`` groups would never be registered)."""
+    fn = getattr(getattr(bot, "tree", None), "red_check_enabled", None)
+    if fn is not None:
+        await fn()
+
+
 @dispatcher.method("slash.list")
 async def slash_list(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     """Top-level app commands with cog and enabled status (owner)."""
@@ -1120,6 +1172,7 @@ async def slash_sync(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     ctx = await _build_context(gateway, params)
     await _require(gateway, ctx, "bot_owner")
     try:
+        await _red_check_enabled(gateway.bot)
         synced = await gateway.bot.tree.sync()
         # Invalidate the registered-commands cache so "not synced" pills clear
         # immediately on the next read instead of after the cache TTL (~60 s).
@@ -1127,8 +1180,8 @@ async def slash_sync(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
         _registered_cmd_cache["cmds"] = None
         gateway.audit("slash.sync", ctx, {"count": len(synced)})
         return {"ok": True, "count": len(synced)}
-    except Exception as e:
-        raise RpcError(INTERNAL_ERROR, f"Sync fehlgeschlagen: {e}")
+    except Exception:
+        raise _internal_error("Sync fehlgeschlagen")
 
 
 @dispatcher.method("slash.set")
@@ -1151,10 +1204,11 @@ async def slash_set(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
             await bot.enable_app_command(name, t)
         else:
             await bot.disable_app_command(name, t)
+        await _red_check_enabled(bot)
     except RpcError:
         raise
-    except Exception as e:
-        raise RpcError(INTERNAL_ERROR, f"Umschalten fehlgeschlagen: {e}")
+    except Exception:
+        raise _internal_error("Umschalten fehlgeschlagen")
     gateway.audit("slash.set", ctx, {"name": name, "type": ctype, "enabled": enabled})
     return {"ok": True, "name": name, "enabled": enabled}
 
@@ -1174,11 +1228,34 @@ async def slash_set_cog(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     try:
         from discord import AppCommandType, app_commands
 
+        # Red keeps DISABLED app commands out of the tree, so the tree alone can never
+        # enable them. Collect the cog's own top-level app commands (incl. hybrid
+        # groups like /wowt, which live on the text command), plus tree commands
+        # bound to a cog of that class name (previous behaviour).
+        cands = []
+        cog = bot.get_cog(cog_name)
+        if cog is not None:
+            try:
+                cands += list(cog.get_app_commands())
+                cands += list(getattr(cog, "__cog_context_menus__", []) or [])
+                for tc in cog.get_commands():
+                    ac = getattr(tc, "app_command", None)
+                    if ac is not None:
+                        cands.append(ac)
+            except Exception:
+                log.debug("slash.set_cog: collecting app commands of %s failed", cog_name, exc_info=True)
         for c in bot.tree.get_commands():
             binding = getattr(c, "binding", None)
-            if binding is None or type(binding).__name__ != cog_name:
-                continue
+            if binding is not None and type(binding).__name__ == cog_name:
+                cands.append(c)
+        done = set()
+        for c in cands:
+            if getattr(c, "parent", None) is not None:
+                continue  # only top-level commands can be enabled/disabled
             ctype = int(c.type.value) if isinstance(c, app_commands.ContextMenu) else 1
+            if (c.name, ctype) in done:
+                continue
+            done.add((c.name, ctype))
             t = AppCommandType(ctype)
             try:
                 if enabled:
@@ -1188,8 +1265,9 @@ async def slash_set_cog(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
                 changed += 1
             except Exception:
                 pass
-    except Exception as e:
-        raise RpcError(INTERNAL_ERROR, f"Cog-Umschalten fehlgeschlagen: {e}")
+        await _red_check_enabled(bot)
+    except Exception:
+        raise _internal_error("Cog-Umschalten fehlgeschlagen")
     gateway.audit("slash.set_cog", ctx, {"cog": cog_name, "enabled": enabled, "changed": changed})
     return {"ok": True, "cog": cog_name, "enabled": enabled, "changed": changed}
 
@@ -1292,8 +1370,8 @@ async def downloader_repos(gateway: Any, params: Dict[str, Any]) -> Dict[str, An
                 })
             repos.sort(key=lambda r: r["name"])
         return {"available": True, "repos": repos}
-    except Exception as e:
-        raise RpcError(INTERNAL_ERROR, f"Repo-Liste fehlgeschlagen: {e}")
+    except Exception:
+        raise _internal_error("Repo-Liste fehlgeschlagen")
 
 
 @dispatcher.method("downloader.repo_add")
@@ -1311,8 +1389,8 @@ async def downloader_repo_add(gateway: Any, params: Dict[str, Any]) -> Dict[str,
         raise RpcError(INVALID_PARAMS, "name und url erforderlich")
     try:
         await dl._repo_manager.add_repo(url=url, name=name, branch=branch)
-    except Exception as e:
-        raise RpcError(INTERNAL_ERROR, f"Repo hinzufügen fehlgeschlagen: {e}")
+    except Exception:
+        raise _internal_error("Repo hinzufügen fehlgeschlagen")
     gateway.audit("downloader.repo_add", ctx, {"name": name, "url": url})
     return {"ok": True, "name": name}
 
@@ -1333,8 +1411,8 @@ async def downloader_repo_remove(gateway: Any, params: Dict[str, Any]) -> Dict[s
         raise RpcError(INVALID_PARAMS, "Repo hat noch installierte Cogs – diese zuerst deinstallieren.")
     try:
         await dl._repo_manager.delete_repo(name)
-    except Exception as e:
-        raise RpcError(INTERNAL_ERROR, f"Repo entfernen fehlgeschlagen: {e}")
+    except Exception:
+        raise _internal_error("Repo entfernen fehlgeschlagen")
     gateway.audit("downloader.repo_remove", ctx, {"name": name})
     return {"ok": True}
 
@@ -1352,8 +1430,8 @@ async def downloader_update_check(gateway: Any, params: Dict[str, Any]) -> Dict[
         # After the repo update: which installed cogs now have an update?
         installed = await _installed_cogs(dl)
         cogs_update = sorted(await _cogs_with_updates(dl, installed))
-    except Exception as e:
-        raise RpcError(INTERNAL_ERROR, f"Update-Check fehlgeschlagen: {e}")
+    except Exception:
+        raise _internal_error("Update-Check fehlgeschlagen")
     gateway.audit("downloader.update_check", ctx, {"changed": changed, "cogs": cogs_update})
     return {"ok": True, "updated_repos": changed, "cogs_with_updates": cogs_update}
 
@@ -1417,8 +1495,8 @@ async def _do_cog_update(
             raise RpcError(INTERNAL_ERROR, f"Update fehlgeschlagen: {cog_name}")
     except RpcError:
         raise
-    except Exception as e:
-        raise RpcError(INTERNAL_ERROR, f"Update fehlgeschlagen: {e}")
+    except Exception:
+        raise _internal_error("Update fehlgeschlagen")
 
     # Automatically after the update: 1) reload the cog (if loaded), 2) sync slash.
     # Use the real, case-correct extension key (NOT cog_name.lower() – that breaks
@@ -1492,8 +1570,8 @@ async def downloader_cog_install(gateway: Any, params: Dict[str, Any]) -> Dict[s
                 raise RpcError(INTERNAL_ERROR, f"Installation fehlgeschlagen: {cog_name}")
         except RpcError:
             raise
-        except Exception as e:
-            raise RpcError(INTERNAL_ERROR, f"Installation fehlgeschlagen: {e}")
+        except Exception:
+            raise _internal_error("Installation fehlgeschlagen")
     gateway.audit("downloader.cog_install", ctx, {"repo": repo_name, "cog": cog_name})
     return {"ok": True, "cog": cog_name, "hint": "Mit cogs.set/load aktivieren."}
 
@@ -1536,8 +1614,8 @@ async def _do_cog_uninstall(gateway: Any, dl: Any, cog_name: str, ctx: Any) -> D
             await dl._remove_from_installed(target)
     except RpcError:
         raise
-    except Exception as e:
-        raise RpcError(INTERNAL_ERROR, f"Uninstall failed: {e}")
+    except Exception:
+        raise _internal_error("Uninstall failed")
     # Delete the cog files (best effort). In current Red, _delete_cog expects a PATH
     # (it calls target.exists()); passing m.name (a str) raised
     # "'str' object has no attribute 'exists'". Build the install path; fall back to
@@ -1645,6 +1723,10 @@ async def settings_set(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
         if ctx.guild is None:
             raise RpcError(INVALID_PARAMS, "Guild-Kontext erforderlich")
         await _require(gateway, ctx, "guild_admin")
+        if field in ("admin_roles", "mod_roles"):
+            # Red itself only lets the guild owner (or bot owner) change its
+            # admin/mod roles – Manage Server must not be able to self-elevate.
+            await _require(gateway, ctx, "guild_owner")
         g = ctx.guild
         if field == "prefixes":
             await bot.set_prefixes([str(p) for p in (value or []) if str(p).strip()], guild=g)
@@ -1660,8 +1742,8 @@ async def settings_set(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
             raise RpcError(INVALID_PARAMS, f"Unbekanntes Feld '{field}'")
     except RpcError:
         raise
-    except Exception as e:
-        raise RpcError(INTERNAL_ERROR, f"Speichern fehlgeschlagen: {e}")
+    except Exception:
+        raise _internal_error("Speichern fehlgeschlagen")
 
     gateway.audit("settings.set", ctx, {"scope": scope, "field": field})
     return {"ok": True}
@@ -1945,6 +2027,12 @@ async def pages_get(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     pages = list(await cog.config.custom_pages()) if cog else []
     for p in pages:
         if p["slug"] == slug:
+            if str(p.get("visibility", "public")).lower() != "public":
+                # Private pages: only for logged-in users (and respecting the
+                # dashboard lock); an optional stored "permission" level is honoured.
+                ctx = await _build_context(gateway, params)
+                perm = str(p.get("permission") or "authenticated")
+                await _require(gateway, ctx, perm)
             return {"page": p}
     raise RpcError(INVALID_PARAMS, "Seite nicht gefunden")
 
@@ -2012,6 +2100,35 @@ def _serverstats(gateway: Any):
     return None
 
 
+def _days_arg(args: Dict[str, Any], default: int = 30) -> int:
+    try:
+        return int(args.get("days", default) or default)
+    except (TypeError, ValueError):
+        raise RpcError(INVALID_PARAMS, "Ungültiger Wert für 'days'")
+
+
+def _accepts_kw(fn: Any, name: str) -> bool:
+    try:
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+async def _stats_viewer(gateway: Any, ctx: DashboardContext):
+    """(viewer, level) for the stats privacy filter.
+
+    ``viewer`` is the requesting guild member whose channel permissions filter
+    channel names/activity; ``None`` (= unfiltered) only for the bot owner.
+    """
+    level = int(await resolve_level(gateway.bot, ctx.user, ctx.guild))
+    viewer = None if level >= int(Level.BOT_OWNER) else ctx.member
+    return viewer, level
+
+
+def _viewer_kwargs(fn: Any, viewer: Any) -> Dict[str, Any]:
+    return {"viewer": viewer} if _accepts_kw(fn, "viewer") else {}
+
+
 async def _stats_call(gateway: Any, params: Dict[str, Any], method_name: str, *extra_keys):
     """Shared helper: build context + check permission + call the cog method."""
     ctx = await _build_context(gateway, params)
@@ -2022,13 +2139,14 @@ async def _stats_call(gateway: Any, params: Dict[str, Any], method_name: str, *e
     if cog is None:
         raise RpcError(INVALID_PARAMS, "WebDashboardStats-Cog ist nicht geladen")
     args = params.get("args") or {}
-    days = int(args.get("days", 30) or 30)
+    days = _days_arg(args)
     fn = getattr(cog, method_name)
     call_args = [ctx.guild]
     for k in extra_keys:
         call_args.append(args.get(k))
     call_args.append(days)
-    return await fn(*call_args)
+    viewer, _level = await _stats_viewer(gateway, ctx)
+    return await fn(*call_args, **_viewer_kwargs(fn, viewer))
 
 
 @dispatcher.method("serverstats.overview")
@@ -2131,8 +2249,8 @@ async def announce_send(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
         msg = await channel.send(content=content, embed=embed)
     except discord.Forbidden:
         raise RpcError(FORBIDDEN, "Dem Bot fehlt die Berechtigung in diesem Kanal")
-    except Exception as e:
-        raise RpcError(INTERNAL_ERROR, f"Senden fehlgeschlagen: {e}")
+    except Exception:
+        raise _internal_error("Senden fehlgeschlagen")
     gateway.audit("announce.send", ctx, {"channel": str(ch_id)})
     return {"ok": True, "message_id": str(msg.id)}
 
@@ -2149,7 +2267,14 @@ async def serverstats_member_drilldown(gateway: Any, params: Dict[str, Any]) -> 
     cog = _serverstats(gateway)
     if cog is None:
         raise RpcError(INVALID_PARAMS, "WebDashboardStats-Cog ist nicht geladen")
-    return await cog.stats_member_drilldown(ctx.guild, member_id, int(args.get("days", 30) or 30))
+    days = _days_arg(args)
+    _viewer, level = await _stats_viewer(gateway, ctx)
+    if level >= int(Level.GUILD_MOD):
+        return await cog.stats_member_drilldown(ctx.guild, member_id, days)
+    # PRIVACY: regular members only get their OWN detail view.
+    if not _accepts_kw(cog.stats_member_drilldown, "own_only"):
+        raise RpcError(FORBIDDEN, "Berechtigung 'guild_mod' erforderlich")
+    return await cog.stats_member_drilldown(ctx.guild, int(ctx.user.id), days, own_only=True)
 
 
 @dispatcher.method("serverstats.channel_drilldown")
@@ -2164,7 +2289,9 @@ async def serverstats_channel_drilldown(gateway: Any, params: Dict[str, Any]) ->
     cog = _serverstats(gateway)
     if cog is None:
         raise RpcError(INVALID_PARAMS, "WebDashboardStats-Cog ist nicht geladen")
-    return await cog.stats_channel_drilldown(ctx.guild, channel_id, int(args.get("days", 30) or 30))
+    viewer, _level = await _stats_viewer(gateway, ctx)
+    fn = cog.stats_channel_drilldown
+    return await fn(ctx.guild, channel_id, _days_arg(args), **_viewer_kwargs(fn, viewer))
 
 
 async def _stats_guild_only(gateway: Any, params: Dict[str, Any], method_name: str) -> Dict[str, Any]:
@@ -2176,7 +2303,9 @@ async def _stats_guild_only(gateway: Any, params: Dict[str, Any], method_name: s
     cog = _serverstats(gateway)
     if cog is None:
         raise RpcError(INVALID_PARAMS, "WebDashboardStats-Cog ist nicht geladen")
-    return await getattr(cog, method_name)(ctx.guild)
+    fn = getattr(cog, method_name)
+    viewer, _level = await _stats_viewer(gateway, ctx)
+    return await fn(ctx.guild, **_viewer_kwargs(fn, viewer))
 
 
 @dispatcher.method("serverstats.peaks")
@@ -2195,7 +2324,7 @@ async def serverstats_heatmap(gateway: Any, params: Dict[str, Any]) -> Dict[str,
         raise RpcError(INVALID_PARAMS, "WebDashboardStats-Cog ist nicht geladen")
     args = params.get("args") or {}
     metric = str(args.get("metric", "messages"))
-    return await cog.stats_heatmap(ctx.guild, int(args.get("days", 30) or 30), metric)
+    return await cog.stats_heatmap(ctx.guild, _days_arg(args), metric)
 
 
 @dispatcher.method("serverstats.now")
@@ -2263,11 +2392,8 @@ def setup_core_methods(gateway: Any) -> Dispatcher:
 
 # --------------------------------------------------------------------------- #
 # Background monitor (cog-update check + alerts) – config for the web UI
+# (uses _dashboard_cog defined above)
 # --------------------------------------------------------------------------- #
-def _dashboard_cog(gateway: Any):
-    return gateway.bot.get_cog("pdc_webdashboard") or gateway.bot.get_cog("WebDashboard")
-
-
 @dispatcher.method("monitor.get")
 async def monitor_get(gateway: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     """Monitor config + last cog-update result (bot owner only)."""

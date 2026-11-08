@@ -16,6 +16,6 @@
     "disabled": false,
     "min_bot_version": "3.5.0",
     "install_msg": "WebDashboardStats installed. Enable the presence/member intents for full status/activity data. The 'Statistics' page appears in the web dashboard.",
-    "end_user_data_statement": "This cog stores aggregated per-guild statistics in daily buckets (message/voice/activity counts, member and channel IDs with counts). Old data is pruned after the retention period. It does not store message content.",
+    "end_user_data_statement": "This cog stores aggregated per-guild statistics in daily buckets (message/voice/activity counts, member and channel IDs with counts). Old data is pruned after the retention period. It also keeps the last 500 invite joins (user ID, username, invite code) and per-inviter join counts. It does not store message content. Data of a user is exported/removed via Red's end-user data commands.",
     "type": "COG"
 }

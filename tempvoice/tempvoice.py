@@ -42,6 +42,10 @@ EMPTY_GRACE_SECONDS = 15
 # Discord allows roughly 2 channel renames per 10 minutes.
 RENAME_MAX = 2
 RENAME_WINDOW = 600
+# Per-user cooldown (seconds) for creating a new temp channel.
+CREATE_COOLDOWN_SECONDS = 30
+# Modal input timeout (seconds).
+MODAL_TIMEOUT_SECONDS = 300
 
 # Fixed custom_ids so the control panel view survives bot restarts.
 _BTN_RENAME = "pdc_tempvoice_rename"
@@ -86,7 +90,7 @@ class _TextModal(discord.ui.Modal):
     """Generic one-field modal used for rename / limit input."""
 
     def __init__(self, title: str, label: str, default: str = "", max_length: int = 100) -> None:
-        super().__init__(title=title[:45])
+        super().__init__(title=title[:45], timeout=MODAL_TIMEOUT_SECONDS)
         self.value: Optional[str] = None
         self.field = discord.ui.TextInput(
             label=label[:45], default=default[:max_length], required=True, max_length=max_length
@@ -105,6 +109,9 @@ class TempVoicePanelView(discord.ui.View):
     def __init__(self, cog: "TempVoice") -> None:
         super().__init__(timeout=None)
         self.cog = cog
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await self.cog._interaction_allowed(interaction)
 
     @discord.ui.button(label="✏️ Rename", style=discord.ButtonStyle.secondary, custom_id=_BTN_RENAME, row=0)
     async def rename(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -153,6 +160,7 @@ class TempVoice(commands.Cog):
         self._rename_log: Dict[int, List[float]] = {}  # channel_id -> rename timestamps
         self._create_locks: Dict[int, asyncio.Lock] = {}  # guild_id -> creation lock
         self._selected_creator: Dict[Tuple[int, int], str] = {}  # dashboard panel selection
+        self._last_create: Dict[Tuple[int, int], float] = {}  # (guild, user) -> last creation ts
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -239,6 +247,34 @@ class TempVoice(commands.Cog):
     def _note_rename(self, channel_id: int) -> None:
         self._rename_log.setdefault(channel_id, []).append(time.time())
 
+    async def _interaction_allowed(self, interaction: discord.Interaction) -> bool:
+        """Honor Red's allow/blocklists, ignored channels and disabled cogs."""
+        guild = interaction.guild
+        try:
+            allowed = (
+                guild is not None
+                and not await self.bot.cog_disabled_in_guild(self, guild)
+                and await self.bot.allowed_by_whitelist_blacklist(interaction.user)
+                and await self.bot.ignored_channel_or_guild(interaction)
+            )
+        except Exception:
+            log.debug("TempVoice: interaction check failed", exc_info=True)
+            allowed = False
+        if not allowed and not interaction.response.is_done():
+            try:
+                await interaction.response.send_message("⛔", ephemeral=True)
+            except discord.HTTPException:
+                pass
+        return allowed
+
+    @staticmethod
+    async def _deferred_reply(interaction: discord.Interaction, coro) -> None:
+        """Defer first (actions do HTTP calls), then send the result as followup."""
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        msg = await coro
+        await interaction.followup.send(msg, ephemeral=True)
+
     async def _bot_can_manage(self, channel: discord.VoiceChannel) -> bool:
         me = channel.guild.me
         perms = channel.permissions_for(me)
@@ -256,7 +292,23 @@ class TempVoice(commands.Cog):
 
         lock = self._create_locks.setdefault(guild.id, asyncio.Lock())
         async with lock:
-            temp = gconf.get("temp_channels", {}) or {}
+            temp = await self.config.guild(guild).temp_channels() or {}
+            # Reuse the member's existing temp channel instead of creating another.
+            for cid, e in temp.items():
+                if isinstance(e, dict) and e.get("owner") == member.id:
+                    existing = guild.get_channel(int(cid)) if str(cid).isdigit() else None
+                    if isinstance(existing, discord.VoiceChannel):
+                        try:
+                            await member.move_to(existing, reason="TempVoice: back to own temp channel")
+                        except discord.HTTPException:
+                            pass
+                        return
+            # Per-user cooldown against join/leave spam on the creator channel.
+            key = (guild.id, member.id)
+            now = time.monotonic()
+            if now - self._last_create.get(key, -CREATE_COOLDOWN_SECONDS) < CREATE_COOLDOWN_SECONDS:
+                return
+            self._last_create[key] = now
             count = sum(1 for e in temp.values() if isinstance(e, dict) and e.get("creator") == creator.id) + 1
             name = _render_name(str(settings.get("name_template") or ""), member, count)
 
@@ -389,7 +441,9 @@ class TempVoice(commands.Cog):
 
         # Join of a creator channel -> spawn a temp channel.
         if after.channel is not None and str(after.channel.id) in creators:
-            if isinstance(after.channel, discord.VoiceChannel):
+            if isinstance(after.channel, discord.VoiceChannel) and not await self.bot.cog_disabled_in_guild(
+                self, member.guild
+            ):
                 await self._create_temp_channel(member, after.channel)
 
         # Leave of a temp channel -> maybe schedule deletion.
@@ -610,8 +664,7 @@ class TempVoice(commands.Cog):
         await modal.wait()
         if modal.value is None or modal.interaction is None:
             return
-        msg = await self._act_rename(channel, modal.value, lang)
-        await modal.interaction.response.send_message(msg, ephemeral=True)
+        await self._deferred_reply(modal.interaction, self._act_rename(channel, modal.value, lang))
 
     async def panel_limit(self, interaction: discord.Interaction) -> None:
         channel, entry, lang = await self._panel_context(interaction)
@@ -632,30 +685,26 @@ class TempVoice(commands.Cog):
                 tr_lang(lang, "Bitte eine Zahl 0–99 eingeben.", "Please enter a number 0–99."), ephemeral=True
             )
             return
-        msg = await self._act_limit(channel, int(modal.value), lang)
-        await modal.interaction.response.send_message(msg, ephemeral=True)
+        await self._deferred_reply(modal.interaction, self._act_limit(channel, int(modal.value), lang))
 
     async def panel_lock_toggle(self, interaction: discord.Interaction) -> None:
         channel, entry, lang = await self._panel_context(interaction)
         if channel is None:
             return
-        msg = await self._act_lock(channel, None, lang)
-        await interaction.response.send_message(msg, ephemeral=True)
+        await self._deferred_reply(interaction, self._act_lock(channel, None, lang))
 
     async def panel_hide_toggle(self, interaction: discord.Interaction) -> None:
         channel, entry, lang = await self._panel_context(interaction)
         if channel is None:
             return
-        msg = await self._act_hide(channel, None, lang)
-        await interaction.response.send_message(msg, ephemeral=True)
+        await self._deferred_reply(interaction, self._act_hide(channel, None, lang))
 
     async def panel_claim(self, interaction: discord.Interaction) -> None:
         # Claiming is intentionally open to everyone (checked inside _act_claim).
         channel, entry, lang = await self._panel_context(interaction, owner_only=False)
         if channel is None:
             return
-        msg = await self._act_claim(channel, interaction.user, lang)
-        await interaction.response.send_message(msg, ephemeral=True)
+        await self._deferred_reply(interaction, self._act_claim(channel, interaction.user, lang))
 
     async def panel_transfer(self, interaction: discord.Interaction, target) -> None:
         channel, entry, lang = await self._panel_context(interaction)
@@ -667,8 +716,7 @@ class TempVoice(commands.Cog):
                 tr_lang(lang, "Mitglied nicht gefunden.", "Member not found."), ephemeral=True
             )
             return
-        msg = await self._act_transfer(channel, member, lang)
-        await interaction.response.send_message(msg, ephemeral=True)
+        await self._deferred_reply(interaction, self._act_transfer(channel, member, lang))
 
     async def panel_kick(self, interaction: discord.Interaction, target) -> None:
         channel, entry, lang = await self._panel_context(interaction)
@@ -680,8 +728,7 @@ class TempVoice(commands.Cog):
                 tr_lang(lang, "Mitglied nicht gefunden.", "Member not found."), ephemeral=True
             )
             return
-        msg = await self._act_kick(channel, interaction.user, member, lang)
-        await interaction.response.send_message(msg, ephemeral=True)
+        await self._deferred_reply(interaction, self._act_kick(channel, interaction.user, member, lang))
 
     # ------------------------------------------------------------------ #
     # Owner slash commands (everyone; ownership is checked at runtime)
